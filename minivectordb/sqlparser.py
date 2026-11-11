@@ -1,0 +1,500 @@
+"""Tokenizer and recursive-descent parser for the SQL subset the task requires.
+
+Supported:
+    CREATE TABLE t (c BIGINT PRIMARY KEY, s VARCHAR(16), v VECTOR(2))
+    CREATE VECTOR INDEX idx ON t(v)
+    INSERT INTO t VALUES (...), (...)
+    UPDATE t SET c = expr, ... [WHERE cond]
+    DELETE FROM t [WHERE cond]
+    SELECT * | col | expr [AS alias], ... FROM t [WHERE cond] [ORDER BY ...] [LIMIT n]
+    BEGIN / COMMIT / ROLLBACK
+
+Everything else raises SqlError(unsupported_sql) or SqlError(syntax_error).
+"""
+from __future__ import annotations
+
+import re
+from typing import Any
+
+from .core import (BIGINT, VECTOR, VARCHAR, Column, SqlError, SYNTAX_ERROR,
+                   UNSUPPORTED_SQL, parse_vector_literal)
+
+TOKEN_RE = re.compile(r"""
+    (?P<ws>\s+)
+  | (?P<line_comment>--[^\n]*|\#[^\n]*)
+  | (?P<block_comment>/\*.*?\*/)
+  | (?P<number>\d+\.\d+(?:[eE][+-]?\d+)?|\.\d+(?:[eE][+-]?\d+)?|\d+(?:[eE][+-]?\d+)?)
+  | (?P<string>'(?:''|\\.|[^'\\])*')
+  | (?P<ident>`[^`]*`|[A-Za-z_][A-Za-z0-9_$]*)
+  | (?P<punct><>|!=|<=|>=|:=|\(|\)|,|;|=|<|>|\*|\+|-|\[|\]|\.)
+""", re.VERBOSE | re.DOTALL)
+
+KEYWORDS = {
+    "SELECT", "FROM", "WHERE", "ORDER", "BY", "LIMIT", "INSERT", "INTO",
+    "VALUES", "UPDATE", "SET", "DELETE", "CREATE", "TABLE", "INDEX", "ON",
+    "BEGIN", "COMMIT", "ROLLBACK", "AND", "OR", "NOT", "NULL", "IS", "AS",
+    "ASC", "DESC", "PRIMARY", "KEY", "BIGINT", "VARCHAR", "VECTOR", "IN",
+    "START", "TRANSACTION", "WORK", "REPLACE", "INTO",
+}
+
+
+class Token:
+    __slots__ = ("kind", "value", "pos")
+
+    def __init__(self, kind: str, value: Any, pos: int) -> None:
+        self.kind = kind
+        self.value = value
+        self.pos = pos
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging helper
+        return f"Token({self.kind!r}, {self.value!r})"
+
+
+def tokenize(sql: str) -> list[Token]:
+    tokens: list[Token] = []
+    pos = 0
+    length = len(sql)
+    while pos < length:
+        match = TOKEN_RE.match(sql, pos)
+        if not match:
+            raise SqlError(SYNTAX_ERROR, f"unexpected character at {pos}: {sql[pos]!r}")
+        kind = match.lastgroup
+        text = match.group()
+        pos = match.end()
+        if kind in ("ws", "line_comment", "block_comment"):
+            continue
+        if kind == "number":
+            if "." in text or "e" in text or "E" in text:
+                tokens.append(Token("number", float(text), match.start()))
+            else:
+                tokens.append(Token("number", int(text), match.start()))
+        elif kind == "string":
+            tokens.append(Token("string", _decode_string(text), match.start()))
+        elif kind == "ident":
+            bare = text[1:-1] if text.startswith("`") else text
+            upper = bare.upper()
+            tokens.append(Token("keyword" if upper in KEYWORDS else "ident", bare, match.start()))
+        else:
+            tokens.append(Token("punct", text, match.start()))
+    tokens.append(Token("eof", None, length))
+    return tokens
+
+
+def _decode_string(raw: str) -> str:
+    body = raw[1:-1]
+    out: list[str] = []
+    index = 0
+    while index < len(body):
+        char = body[index]
+        if char == "\\" and index + 1 < len(body):
+            nxt = body[index + 1]
+            mapping = {"n": "\n", "t": "\t", "r": "\r", "0": "\0", "\\": "\\",
+                       "'": "'", '"': '"', "b": "\b", "Z": "\x1a"}
+            out.append(mapping.get(nxt, nxt))
+            index += 2
+            continue
+        if char == "'" and index + 1 < len(body) and body[index + 1] == "'":
+            out.append("'")
+            index += 2
+            continue
+        out.append(char)
+        index += 1
+    return "".join(out)
+
+
+# ---------------------------------------------------------------- AST nodes
+#
+# Expressions are plain tuples so evaluation stays allocation-light:
+#   ("col", name) ("lit", value) ("vec", [floats]) ("func", name, [args])
+#   ("binop", op, left, right) ("and", l, r) ("or", l, r) ("not", e) ("isnull", e)
+
+class Parser:
+    def __init__(self, sql: str) -> None:
+        self.sql = sql
+        self.tokens = tokenize(sql)
+        self.index = 0
+
+    # -- helpers
+    def peek(self, offset: int = 0) -> Token:
+        return self.tokens[min(self.index + offset, len(self.tokens) - 1)]
+
+    def next(self) -> Token:
+        token = self.tokens[self.index]
+        if token.kind != "eof":
+            self.index += 1
+        return token
+
+    def at_keyword(self, *words: str) -> bool:
+        token = self.peek()
+        return token.kind == "keyword" and token.value.upper() in words
+
+    def eat_keyword(self, *words: str) -> bool:
+        if self.at_keyword(*words):
+            self.next()
+            return True
+        return False
+
+    def expect_keyword(self, *words: str) -> None:
+        if not self.eat_keyword(*words):
+            raise SqlError(SYNTAX_ERROR, f"expected {'/'.join(words)} near {self.peek().value!r}")
+
+    def at_punct(self, text: str) -> bool:
+        token = self.peek()
+        return token.kind == "punct" and token.value == text
+
+    def eat_punct(self, text: str) -> bool:
+        if self.at_punct(text):
+            self.next()
+            return True
+        return False
+
+    def expect_punct(self, text: str) -> None:
+        if not self.eat_punct(text):
+            raise SqlError(SYNTAX_ERROR, f"expected {text!r} near {self.peek().value!r}")
+
+    def identifier(self) -> str:
+        token = self.peek()
+        if token.kind in ("ident", "keyword"):
+            self.next()
+            return str(token.value)
+        raise SqlError(SYNTAX_ERROR, f"expected identifier near {token.value!r}")
+
+    # -- statements
+    def parse_statement(self) -> dict:
+        self.eat_punct(";")
+        token = self.peek()
+        if token.kind != "keyword":
+            raise SqlError(UNSUPPORTED_SQL, f"unsupported statement: {self.sql.strip()[:60]!r}")
+        word = str(token.value).upper()
+        if word == "CREATE":
+            return self.parse_create()
+        if word == "INSERT":
+            return self.parse_insert()
+        if word == "UPDATE":
+            return self.parse_update()
+        if word == "DELETE":
+            return self.parse_delete()
+        if word == "SELECT":
+            return self.parse_select()
+        if word in ("BEGIN", "START"):
+            self.next()
+            self.eat_keyword("TRANSACTION")
+            self.eat_keyword("WORK")
+            self.eat_punct(";")
+            return {"kind": "begin"}
+        if word == "COMMIT":
+            self.next()
+            self.eat_keyword("TRANSACTION")
+            self.eat_keyword("WORK")
+            self.eat_punct(";")
+            return {"kind": "commit"}
+        if word == "ROLLBACK":
+            self.next()
+            self.eat_keyword("TRANSACTION")
+            self.eat_keyword("WORK")
+            self.eat_punct(";")
+            return {"kind": "rollback"}
+        raise SqlError(UNSUPPORTED_SQL, f"unsupported statement: {word}")
+
+    def parse_create(self) -> dict:
+        self.expect_keyword("CREATE")
+        if self.at_keyword("TABLE"):
+            return self.parse_create_table()
+        if self.at_keyword("VECTOR", "UNIQUE", "INDEX", "FULLTEXT"):
+            self.eat_keyword("VECTOR", "UNIQUE", "FULLTEXT")
+            self.expect_keyword("INDEX")
+            name = self.identifier()
+            self.expect_keyword("ON")
+            table = self.identifier()
+            self.expect_punct("(")
+            column = self.identifier()
+            self.expect_punct(")")
+            self.eat_punct(";")
+            return {"kind": "create_index", "name": name, "table": table, "column": column}
+        raise SqlError(UNSUPPORTED_SQL, f"unsupported CREATE near {self.peek().value!r}")
+
+    def parse_create_table(self) -> dict:
+        self.expect_keyword("TABLE")
+        table = self.identifier()
+        self.expect_punct("(")
+        columns: list[Column] = []
+        while True:
+            name = self.identifier()
+            token = self.peek()
+            if token.kind != "keyword":
+                raise SqlError(SYNTAX_ERROR, f"expected column type near {token.value!r}")
+            type_name = str(token.value).upper()
+            self.next()
+            length = dim = None
+            if self.at_punct("("):
+                self.next()
+                number = self.next()
+                if number.kind != "number" or not isinstance(number.value, int):
+                    raise SqlError(SYNTAX_ERROR, "column length/dimension must be an integer")
+                if type_name == VARCHAR:
+                    length = number.value
+                elif type_name == VECTOR:
+                    dim = number.value
+                    if dim <= 0:
+                        raise SqlError(SYNTAX_ERROR, "vector dimension must be positive")
+                else:
+                    raise SqlError(UNSUPPORTED_SQL, f"{type_name} does not take a length")
+                self.expect_punct(")")
+            primary = False
+            if self.at_keyword("PRIMARY"):
+                self.next()
+                self.expect_keyword("KEY")
+                primary = True
+            if self.at_keyword("NOT"):
+                self.next()
+                self.expect_keyword("NULL")
+            columns.append(Column(name, type_name, length, dim, primary))
+            if not self.eat_punct(","):
+                break
+        self.expect_punct(")")
+        self.eat_punct(";")
+        if not columns:
+            raise SqlError(SYNTAX_ERROR, "table needs at least one column")
+        return {"kind": "create_table", "table": table, "columns": columns}
+
+    def parse_insert(self) -> dict:
+        self.expect_keyword("INSERT")
+        self.expect_keyword("INTO")
+        table = self.identifier()
+        columns: list[str] | None = None
+        if self.at_punct("("):
+            self.next()
+            columns = []
+            while True:
+                columns.append(self.identifier())
+                if not self.eat_punct(","):
+                    break
+            self.expect_punct(")")
+        self.expect_keyword("VALUES")
+        rows: list[list[Any]] = []
+        while True:
+            self.expect_punct("(")
+            values: list[Any] = []
+            while True:
+                values.append(self.parse_literal())
+                if not self.eat_punct(","):
+                    break
+            self.expect_punct(")")
+            rows.append(values)
+            if not self.eat_punct(","):
+                break
+        self.eat_punct(";")
+        return {"kind": "insert", "table": table, "columns": columns, "rows": rows}
+
+    def parse_update(self) -> dict:
+        self.expect_keyword("UPDATE")
+        table = self.identifier()
+        self.expect_keyword("SET")
+        assignments: list[tuple[str, Any]] = []
+        while True:
+            column = self.identifier()
+            self.expect_punct("=")
+            assignments.append((column, self.parse_expression()))
+            if not self.eat_punct(","):
+                break
+        where = None
+        if self.eat_keyword("WHERE"):
+            where = self.parse_expression()
+        self.eat_punct(";")
+        return {"kind": "update", "table": table, "assignments": assignments, "where": where}
+
+    def parse_delete(self) -> dict:
+        self.expect_keyword("DELETE")
+        self.expect_keyword("FROM")
+        table = self.identifier()
+        where = None
+        if self.eat_keyword("WHERE"):
+            where = self.parse_expression()
+        self.eat_punct(";")
+        return {"kind": "delete", "table": table, "where": where}
+
+    def parse_select(self) -> dict:
+        self.expect_keyword("SELECT")
+        items: list[dict] = []
+        if self.eat_punct("*"):
+            items.append({"expr": ("star",), "alias": None})
+        else:
+            while True:
+                expr = self.parse_expression()
+                alias = None
+                if self.eat_keyword("AS"):
+                    alias = self.identifier()
+                items.append({"expr": expr, "alias": alias})
+                if not self.eat_punct(","):
+                    break
+        self.expect_keyword("FROM")
+        table = self.identifier()
+        where = None
+        if self.eat_keyword("WHERE"):
+            where = self.parse_expression()
+        order: list[tuple[Any, bool]] = []
+        if self.eat_keyword("ORDER"):
+            self.expect_keyword("BY")
+            while True:
+                expr = self.parse_expression()
+                descending = False
+                if self.eat_keyword("DESC"):
+                    descending = True
+                else:
+                    self.eat_keyword("ASC")
+                order.append((expr, descending))
+                if not self.eat_punct(","):
+                    break
+        limit = None
+        if self.eat_keyword("LIMIT"):
+            token = self.next()
+            if token.kind != "number" or not isinstance(token.value, int):
+                raise SqlError(SYNTAX_ERROR, "LIMIT expects an integer")
+            limit = token.value
+        self.eat_punct(";")
+        return {"kind": "select", "items": items, "table": table, "where": where,
+                "order": order, "limit": limit}
+
+    # -- expressions
+    def parse_literal(self) -> Any:
+        token = self.peek()
+        if self.at_punct("-"):
+            self.next()
+            inner = self.parse_literal()
+            if inner[0] == "lit" and isinstance(inner[1], (int, float)):
+                return ("lit", -inner[1])
+            raise SqlError(SYNTAX_ERROR, "unsupported unary minus")
+        if token.kind == "number":
+            self.next()
+            return ("lit", token.value)
+        if token.kind == "string":
+            self.next()
+            return ("str", token.value)
+        if self.at_punct("["):
+            self.next()
+            values: list[float] = []
+            if not self.at_punct("]"):
+                while True:
+                    sign = 1.0
+                    if self.at_punct("-"):
+                        self.next()
+                        sign = -1.0
+                    elif self.at_punct("+"):
+                        self.next()
+                    item = self.next()
+                    if item.kind != "number":
+                        raise SqlError(SYNTAX_ERROR, "vector literal expects numbers")
+                    values.append(sign * float(item.value))
+                    if not self.eat_punct(","):
+                        break
+            self.expect_punct("]")
+            return ("vec", values)
+        if self.at_keyword("NULL"):
+            self.next()
+            return ("lit", None)
+        raise SqlError(SYNTAX_ERROR, f"unexpected value near {token.value!r}")
+
+    def parse_expression(self) -> Any:
+        return self.parse_or()
+
+    def parse_or(self) -> Any:
+        left = self.parse_and()
+        while self.eat_keyword("OR"):
+            left = ("or", left, self.parse_and())
+        return left
+
+    def parse_and(self) -> Any:
+        left = self.parse_not()
+        while self.eat_keyword("AND"):
+            left = ("and", left, self.parse_not())
+        return left
+
+    def parse_not(self) -> Any:
+        if self.eat_keyword("NOT"):
+            return ("not", self.parse_not())
+        return self.parse_comparison()
+
+    def parse_comparison(self) -> Any:
+        left = self.parse_primary()
+        token = self.peek()
+        if token.kind == "punct" and token.value in ("=", "<>", "!=", "<", "<=", ">", ">="):
+            self.next()
+            op = "!=" if token.value == "!=" else token.value
+            right = self.parse_primary()
+            return ("binop", op, left, right)
+        if self.at_keyword("IS"):
+            self.next()
+            negate = self.eat_keyword("NOT")
+            self.expect_keyword("NULL")
+            expr = ("isnull", left)
+            return ("not", expr) if negate else expr
+        if self.at_keyword("IN"):
+            self.next()
+            self.expect_punct("(")
+            items = []
+            while True:
+                items.append(self.parse_primary())
+                if not self.eat_punct(","):
+                    break
+            self.expect_punct(")")
+            return ("in", left, items)
+        return left
+
+    def parse_primary(self) -> Any:
+        token = self.peek()
+        if token.kind == "punct" and token.value == "(":
+            self.next()
+            expr = self.parse_expression()
+            self.expect_punct(")")
+            return expr
+        if token.kind == "punct" and token.value == "-":
+            self.next()
+            inner = self.parse_primary()
+            if inner[0] == "lit" and isinstance(inner[1], (int, float)):
+                return ("lit", -inner[1])
+            return ("neg", inner)
+        if token.kind == "number":
+            self.next()
+            return ("lit", token.value)
+        if token.kind == "string":
+            self.next()
+            return ("str", token.value)
+        if token.kind == "punct" and token.value == "[":
+            return self.parse_literal()
+        if token.kind == "ident":
+            name = str(token.value)
+            self.next()
+            if self.at_punct("("):
+                self.next()
+                args: list[Any] = []
+                if not self.at_punct(")"):
+                    while True:
+                        args.append(self.parse_expression())
+                        if not self.eat_punct(","):
+                            break
+                self.expect_punct(")")
+                return ("func", name.upper(), args)
+            return ("col", name)
+        if token.kind == "keyword":
+            word = str(token.value).upper()
+            if word == "NULL":
+                self.next()
+                return ("lit", None)
+            if word in ("TRUE", "FALSE"):
+                self.next()
+                return ("lit", word == "TRUE")
+            if word in ("SELECT", "INSERT", "UPDATE", "DELETE", "CREATE", "ALTER",
+                        "DROP", "SET", "SHOW", "USE", "GRANT", "REVOKE", "TRUNCATE"):
+                raise SqlError(UNSUPPORTED_SQL, f"unsupported expression near {word}")
+        raise SqlError(SYNTAX_ERROR, f"unexpected token near {token.value!r}")
+
+
+def parse(sql: str) -> dict:
+    parser = Parser(sql)
+    statement = parser.parse_statement()
+    if parser.peek().kind != "eof":
+        raise SqlError(SYNTAX_ERROR, f"trailing input near {parser.peek().value!r}")
+    return statement
+
+
+__all__ = ["parse", "tokenize", "Parser", "Token", "parse_vector_literal"]

@@ -1,0 +1,10 @@
+# Keep the Docker build context minimal.  The image only needs main.py and the
+# minivectordb package; this repository also carries a large C++ source tree
+# that must not be uploaded to the builder as build context.
+*
+!main.py
+!minivectordb
+!minivectordb/**
+
+__pycache__/
+*.pyc
