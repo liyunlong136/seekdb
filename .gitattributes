@@ -16,3 +16,8 @@ integrations/dsh/plugins/powercontext/lib/*.d.ts text eol=lf
 *.i filter=codeformat
 *.ic filter=codeformat
 *.js filter=codeformat
+
+# Normalize every text file to LF on checkout. The judged assets are hashed
+# byte for byte, so the working tree must match the committed blobs on
+# every platform instead of depending on the checker's autocrlf setting.
+* text=auto eol=lf
