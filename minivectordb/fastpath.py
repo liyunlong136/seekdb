@@ -16,6 +16,7 @@ The helpers never change the semantics of a query:
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 try:  # pragma: no cover - depends on the image
@@ -36,6 +37,34 @@ def module() -> Any:
     """The numpy module, or ``None`` when it is unavailable."""
 
     return _np
+
+
+def map_column(path: str, dtype: str, elements: int, per_slot: int = 1) -> Any:
+    """Memory map a fixed width column file.
+
+    The file holds ``elements`` items of ``per_slot`` values each.  Mapping
+    instead of reading keeps the resident memory bounded: the operating
+    system serves the pages from the page cache and reclaims them under
+    pressure, so a table that is larger than the memory budget stays
+    searchable.  ``None`` is returned when the file cannot be mapped.
+    """
+
+    if _np is None:
+        return None
+    itemsize = _np.dtype(dtype).itemsize
+    needed = elements * per_slot * itemsize
+    try:
+        if os.path.getsize(path) < needed:
+            return None
+    except OSError:
+        return None
+    try:
+        flat = _np.memmap(path, dtype=dtype, mode="r", shape=(elements * per_slot,))
+    except (OSError, ValueError):
+        return None
+    if per_slot == 1:
+        return flat
+    return flat.reshape(elements, per_slot)
 
 
 def load_fixed_column(path: str, dtype: str, elements: int) -> Any:
@@ -68,15 +97,34 @@ def load_live_mask(path: str, count: int) -> Any:
 def l2_distances(matrix: Any, query: Any) -> Any:
     """Euclidean distance of every row of ``matrix`` to ``query``.
 
-    ``matrix`` holds float32 values, ``query`` is the float32 query vector.
-    The accumulation happens in float64, matching the reference implementation.
+    ``matrix`` holds float32 or float64 values, ``query`` is the float32
+    query vector.  The accumulation happens in float64, matching the
+    reference implementation.  The difference is taken before the squaring,
+    so no cancellation can happen and a near zero distance stays accurate.
     """
 
     if _np is None:
         return None
-    diff = matrix.astype(_np.float64)
-    diff -= query.astype(_np.float64)
+    diff = matrix.astype(_np.float64, copy=False)
+    diff = diff - query.astype(_np.float64, copy=False)
     squared = _np.einsum("ij,ij->i", diff, diff)
+    return _np.sqrt(squared)
+
+
+def l2_distances_into(matrix: Any, query: Any, scratch: Any) -> Any:
+    """``l2_distances`` with a reusable difference buffer.
+
+    Allocating the difference for every chunk costs a fresh multi megabyte
+    allocation each time, which is the most expensive part of the scan.  The
+    caller keeps the buffer alive, so the scan only pays for the memory it
+    touches.  ``matrix`` has to be float64 so that the subtraction runs in
+    float64; the result is identical to ``l2_distances``.
+    """
+
+    if _np is None:
+        return None
+    _np.subtract(matrix, query.astype(_np.float64, copy=False), out=scratch)
+    squared = _np.einsum("ij,ij->i", scratch, scratch)
     return _np.sqrt(squared)
 
 

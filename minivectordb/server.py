@@ -18,8 +18,18 @@ from .engine import Engine
 
 
 def _write(stream, payload: dict) -> None:
-    stream.write(json.dumps(payload, ensure_ascii=True, allow_nan=False,
-                            separators=(",", ":")) + "\n")
+    try:
+        line = json.dumps(payload, ensure_ascii=True, allow_nan=False,
+                          separators=(",", ":"))
+    except ValueError:
+        # A non-finite number would make the response invalid JSON.  The
+        # protocol forbids NaN and Infinity, so report the problem instead of
+        # breaking the one-response-per-request contract.
+        line = json.dumps({"id": payload.get("id"), "ok": False,
+                           "error": {"code": INTERNAL_ERROR,
+                                     "message": "response contains a non-finite number"}},
+                          ensure_ascii=True, separators=(",", ":"))
+    stream.write(line + "\n")
     stream.flush()
 
 

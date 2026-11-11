@@ -346,8 +346,13 @@ class Engine:
         primaries = [c for c in columns if c.primary_key]
         if len(primaries) > 1:
             raise SqlError(CONSTRAINT_VIOLATION, "only one primary key is allowed")
-        if primaries and primaries[0].type != BIGINT:
+        if not primaries:
+            raise SqlError(CONSTRAINT_VIOLATION, "a table needs one BIGINT primary key")
+        if primaries[0].type != BIGINT:
             raise SqlError(UNSUPPORTED_SQL, "primary key must be BIGINT")
+        vectors = [c for c in columns if c.type == VECTOR]
+        if len(vectors) > 1:
+            raise SqlError(CONSTRAINT_VIOLATION, "a table allows at most one vector column")
         table = Table(name, columns, table_directory(self.data_dir, name))
         self.tables[name.lower()] = table
         self._save_catalog()
@@ -498,6 +503,13 @@ class Engine:
             targets = list(range(len(table.columns)))
         else:
             targets = [table.column_index(name) for name in names]
+        if len(set(targets)) != len(table.columns):
+            # NULL is not part of the supported subset, so every column has to
+            # get a value; a missing column cannot fall back to a default.
+            missing = [c.name for c in table.columns
+                       if table.columns.index(c) not in set(targets)]
+            raise SqlError(CONSTRAINT_VIOLATION,
+                           "every column needs a value, missing: " + ", ".join(missing))
         pk_position = table.columns.index(table.primary_key)
 
         prepared: list[tuple[int, list[Any]]] = []
@@ -551,8 +563,13 @@ class Engine:
                 values[position] = self._coerce(table.columns[position], node)
             if pk_position is not None:
                 new_pk = values[pk_position]
-                if new_pk != pk and self._exists(table, new_pk):
-                    raise SqlError(DUPLICATE_KEY, f"duplicate primary key {new_pk}")
+                if new_pk != pk:
+                    # The task does not support updating a primary key.  It is
+                    # rejected instead of being executed, because the row would
+                    # otherwise be stored under the old key while the column
+                    # holds the new one.
+                    raise SqlError(UNSUPPORTED_SQL,
+                                   "updating the primary key is not supported")
                 if not isinstance(new_pk, int) or isinstance(new_pk, bool):
                     raise SqlError(TYPE_MISMATCH, "primary key must be a BIGINT")
             targets.append((pk, values))
@@ -691,47 +708,179 @@ class Engine:
 
         numpy = fastpath.module()
         store = table.store
-        matrix = store.fixed_column_array(column_position)
-        if matrix is None:
-            return None
         nulls = store.null_mask(column_position)
         if nulls is not None and bool(nulls.any()):
             return None                      # NULL vectors: generic path decides
-        live = store.live_mask()
-        pks = store.primary_keys()
-        if live is None or pks is None:
-            return None
-
-        keep = live
-        where = statement["where"]
-        if where is not None:
-            filter_mask = self._fast_filter(table, where)
-            if filter_mask is None:
-                return None
-            keep = keep & filter_mask
 
         names, projections = self._select_projections(table, statement)
-        slots = numpy.flatnonzero(keep)
-        if slots.size == 0:
+        if int(limit) <= 0:
             return {"columns": names, "rows": []}
-
-        query_array = numpy.frombuffer(memoryview(query), dtype=numpy.float32)
-        distances = fastpath.l2_distances(matrix[slots], query_array)
-        chosen = slots[fastpath.select_topk(distances, pks[slots], int(limit))]
+        candidates = self._scan_topk(table, column_position, query,
+                                     statement["where"], int(limit))
+        if candidates is None:
+            return None
+        if not candidates:
+            return {"columns": names, "rows": []}
 
         # The distances of the selected rows are recomputed with the reference
         # implementation, so the reported numbers and the tie-break order are
         # exactly the ones a pure-Python scan would have produced.
         selected: list[tuple[float, int, list[Any]]] = []
-        for slot in chosen:
-            slot = int(slot)
+        for _distance, _pk, slot in candidates:
             raw = store.read_slot(slot)
             distance = l2_distance(_as_vector(raw[column_position]), query)
             values = [self._project(expr, table, raw) for expr, _ in projections]
-            selected.append((distance, int(pks[slot]), values))
+            selected.append((distance, int(store.read_pk(slot)), values))
         selected.sort(key=lambda item: (item[0], item[1]))
-        output = [[_json_value(value) for value in values] for _distance, _pk, values in selected]
+        output = [[_json_value(value) for value in values]
+                  for _distance, _pk, values in selected[:int(limit)]]
         return {"columns": names, "rows": output}
+
+    # Slots processed per chunk by the vectorised scan.  The chunk bounds the
+    # memory the scan needs, so a table that is larger than the memory budget
+    # stays searchable.
+    SCAN_CHUNK = 4096
+
+    def _scan_topk(self, table: Table, column_position: int, query: Any,
+                   where: Any, limit: int) -> list[tuple[float, int, int]] | None:
+        """Scan the vector column and return the closest rows.
+
+        The result holds ``(distance, primary key, slot)`` triples.  The
+        column is scanned in chunks, so the scan never needs the whole
+        column in memory.  ``None`` means that the statement shape is not
+        handled here and the generic executor has to take over.
+        """
+
+        numpy = fastpath.module()
+        store = table.store
+        total = store.slot_count
+        if total == 0:
+            return []
+        matrix64 = store.vector_matrix64(column_position)
+        matrix32 = None if matrix64 is not None else store.fixed_column_array(column_position)
+        if matrix64 is None and matrix32 is None:
+            return None
+        live = store.live_mask()
+        pks = store.primary_keys()
+        if live is None or pks is None:
+            return None
+
+        query_array = numpy.frombuffer(memoryview(query), dtype=numpy.float32)
+        dim = table.columns[column_position].dim or 0
+        scratch = self._scan_buffer(dim)
+        candidates: list[tuple[float, int, int]] = []
+        for start in range(0, total, self.SCAN_CHUNK):
+            end = min(start + self.SCAN_CHUNK, total)
+            keep = live[start:end]
+            if where is not None:
+                mask = self._fast_filter_block(table, where, start, end)
+                if mask is None:
+                    return None
+                keep = keep & mask
+            if matrix64 is not None:
+                block = matrix64[start:end]
+            else:
+                block = matrix32[start:end].astype(numpy.float64)
+            block_pks = pks[start:end]
+            if bool(keep.all()):
+                rows = block
+                slots = numpy.arange(start, end, dtype=numpy.int64)
+            else:
+                selected = numpy.flatnonzero(keep)
+                if selected.size == 0:
+                    continue
+                rows = block[selected]
+                block_pks = block_pks[selected]
+                slots = selected + start
+            if matrix64 is not None:
+                distances = fastpath.l2_distances_into(rows, query_array,
+                                                      scratch[:rows.shape[0]])
+            else:
+                distances = fastpath.l2_distances(rows, query_array)
+            for index in fastpath.select_topk(distances, block_pks, limit):
+                candidates.append((float(distances[index]), int(block_pks[index]),
+                                   int(slots[index])))
+
+        if not candidates:
+            return []
+        # The per chunk candidates already contain the rows that can reach the
+        # global top k.  The rows that tie with the boundary distance are kept
+        # as well, so the reference distances can decide the order the same
+        # way a pure-Python scan would.
+        candidates.sort(key=lambda item: (item[0], item[1]))
+        boundary = candidates[min(limit, len(candidates)) - 1][0]
+        tolerance = max(1e-9, abs(boundary) * 1e-9)
+        return [item for item in candidates if item[0] <= boundary + tolerance]
+
+    def _scan_buffer(self, dim: int):
+        """The reusable float64 difference buffer of the vectorised scan."""
+
+        numpy = fastpath.module()
+        rows = self.SCAN_CHUNK
+        buffer = getattr(self, "_scan_scratch", None)
+        if buffer is None or buffer.shape != (rows, dim):
+            buffer = numpy.empty((rows, dim), dtype=numpy.float64)
+            self._scan_scratch = buffer
+        return buffer
+
+    def _fast_filter_block(self, table: Table, where: Any, start: int, end: int):
+        """Vectorised evaluation of a WHERE clause over one chunk of slots.
+
+        Only the shapes whose semantics are unambiguous are handled: a
+        conjunction of comparisons between one normal column and a literal.
+        Everything else returns ``None`` and the generic executor takes over.
+        """
+
+        numpy = fastpath.module()
+        if where[0] == "and":
+            left = self._fast_filter_block(table, where[1], start, end)
+            right = self._fast_filter_block(table, where[2], start, end)
+            if left is None or right is None:
+                return None
+            return left & right
+        if where[0] != "binop":
+            return None
+        operator, left_expr, right_expr = where[1], where[2], where[3]
+        if left_expr[0] == "col" and right_expr[0] in ("lit", "str"):
+            column_expr, literal = left_expr, right_expr
+        elif right_expr[0] == "col" and left_expr[0] in ("lit", "str"):
+            column_expr, literal = right_expr, left_expr
+            operator = _REVERSED_OPERATORS.get(operator, operator)
+        else:
+            return None
+        try:
+            column = table.column(column_expr[1])
+        except SqlError:
+            return None
+        position = table.column_index(column_expr[1])
+        store = table.store
+        nulls = store.null_mask(position)
+        if nulls is None:
+            return None
+        if column.type == BIGINT:
+            if literal[0] != "lit" or isinstance(literal[1], bool):
+                return None
+            if not isinstance(literal[1], (int, float)):
+                return None
+            values = store.fixed_column_array(position)
+            if values is None:
+                return None
+            mask = _numeric_mask(numpy, values[start:end], operator, literal[1])
+            if mask is None:
+                return None
+            return mask & ~nulls[start:end]
+        if column.type == VARCHAR:
+            if literal[0] != "str":
+                return None
+            arena, offsets, lengths = store.varchar_column_bytes(position, start, end)
+            if arena is None or offsets is None or lengths is None:
+                return None
+            mask = fastpath.compare_bytes(arena, offsets, lengths,
+                                          literal[1].encode("utf-8"), operator)
+            if mask is None:
+                return None
+            return mask & ~nulls[start:end]
+        return None
 
     def _distance_target(self, table: Table, statement: dict, expression: Any):
         """Return ``(column position, query vector)`` for a distance order key."""
@@ -773,64 +922,6 @@ class Engine:
         if column_position is None or query is None:
             return None
         return column_position, query
-
-    def _fast_filter(self, table: Table, where: Any):
-        """Vectorised evaluation of a WHERE clause over the columnar files.
-
-        Only the shapes whose semantics are unambiguous are handled: a
-        conjunction of comparisons between one normal column and a literal.
-        Everything else returns ``None`` and the generic executor takes over.
-        """
-
-        numpy = fastpath.module()
-        if where[0] == "and":
-            left = self._fast_filter(table, where[1])
-            right = self._fast_filter(table, where[2])
-            if left is None or right is None:
-                return None
-            return left & right
-        if where[0] != "binop":
-            return None
-        operator, left_expr, right_expr = where[1], where[2], where[3]
-        if left_expr[0] == "col" and right_expr[0] in ("lit", "str"):
-            column_expr, literal = left_expr, right_expr
-        elif right_expr[0] == "col" and left_expr[0] in ("lit", "str"):
-            column_expr, literal = right_expr, left_expr
-            operator = _REVERSED_OPERATORS.get(operator, operator)
-        else:
-            return None
-        try:
-            column = table.column(column_expr[1])
-        except SqlError:
-            return None
-        position = table.column_index(column_expr[1])
-        store = table.store
-        nulls = store.null_mask(position)
-        if nulls is None:
-            return None
-        if column.type == BIGINT:
-            if literal[0] != "lit" or isinstance(literal[1], bool):
-                return None
-            if not isinstance(literal[1], (int, float)):
-                return None
-            values = store.fixed_column_array(position)
-            if values is None:
-                return None
-            mask = _numeric_mask(numpy, values, operator, literal[1])
-            if mask is None:
-                return None
-            return mask & ~nulls
-        if column.type == VARCHAR:
-            if literal[0] != "str":
-                return None
-            arena, offsets, lengths = store.varchar_column_bytes(position)
-            if arena is None or offsets is None or lengths is None:
-                return None
-            mask = fastpath.compare_bytes(arena, offsets, lengths, literal[1].encode("utf-8"), operator)
-            if mask is None:
-                return None
-            return mask & ~nulls
-        return None
 
     def _project(self, expr: Any, table: Table, row: list[Any]) -> Any:
         value = self._evaluate(expr, table, row)

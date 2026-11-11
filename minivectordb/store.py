@@ -57,6 +57,10 @@ _HAS_RESIZE = hasattr(mmap.mmap, "resize")
 # coarse chunks instead of on every write.
 MAP_CHUNK = 1 << 20
 
+# Upper bound for the cached float64 copy of a vector column.  A bigger
+# column is scanned in chunks instead, which keeps the memory bounded.
+FLOAT64_CACHE_BYTES = 64 * 1024 * 1024
+
 _EMPTY = -1
 _TOMB = -2
 
@@ -346,6 +350,7 @@ class ColumnarStore:
                 self._offs.append(None)
                 self._lens.append(None)
         self._index = PkIndex()
+        self._numpy_cache: dict = {}
         self._rebuild_index()
 
     # -- geometry ----------------------------------------------------------
@@ -452,6 +457,30 @@ class ColumnarStore:
     # The vectorised TopK scan reads whole columns at once.  These helpers
     # expose the columnar files as numpy arrays; they return ``None`` when
     # numpy is unavailable or the column is not fixed width.
+    #
+    # The fixed width columns are memory mapped rather than read into a
+    # buffer, so the resident memory of a scan does not grow with the size
+    # of the table.  The pages the scan touches are served from the page
+    # cache and can be reclaimed, which is what keeps a table that is
+    # larger than the memory budget searchable.
+
+    def _mapped(self, key: tuple, path: str, dtype: str, elements: int,
+                per_slot: int = 1) -> Any:
+        """A cached numpy view of a column file."""
+
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            return None
+        entry = self._numpy_cache.get(key)
+        if entry is not None and entry[0] == size:
+            return entry[1]
+        view = fastpath.map_column(path, dtype, elements, per_slot)
+        if view is None:
+            self._numpy_cache.pop(key, None)
+            return None
+        self._numpy_cache[key] = (size, view)
+        return view
 
     def fixed_column_array(self, position: int) -> Any:
         """A fixed width column as a numpy array, one value per slot.
@@ -465,24 +494,59 @@ class ColumnarStore:
         column = self.columns[position]
         count = self.slot_count
         if column.type == BIGINT:
-            values = fastpath.load_fixed_column(self._arena[position].path, "<i8", count)
-            return values
+            return self._mapped(("col", position), self._arena[position].path,
+                                "<i8", count)
         if column.type == VECTOR:
             dim = column.dim or 0
             if dim <= 0:
                 return None
-            values = fastpath.load_fixed_column(self._arena[position].path, "<f4", count * dim)
-            if values is None:
-                return None
-            return values.reshape(count, dim)
+            return self._mapped(("col", position), self._arena[position].path,
+                                "<f4", count, dim)
         return None
+
+    def vector_matrix64(self, position: int) -> Any:
+        """The vector column as a ``float64`` matrix, cached between queries.
+
+        The distances are accumulated in float64, so the scan needs the
+        values in that precision.  Converting the column once and keeping
+        the result removes the per query conversion, which is the most
+        expensive part of the scan.  The cache is only used while it stays
+        inside ``FLOAT64_CACHE_BYTES``; a bigger table is scanned in
+        chunks instead, which keeps the memory bounded.
+        """
+
+        if not fastpath.available():
+            return None
+        column = self.columns[position]
+        dim = column.dim or 0
+        count = self.slot_count
+        if dim <= 0 or count == 0:
+            return None
+        if count * dim * 8 > FLOAT64_CACHE_BYTES:
+            return None
+        key = ("col64", position)
+        try:
+            size = self._arena[position].size
+        except OSError:
+            return None
+        entry = self._numpy_cache.get(key)
+        if entry is not None and entry[0] == size:
+            return entry[1]
+        source = self.fixed_column_array(position)
+        if source is None:
+            return None
+        numpy = fastpath.module()
+        converted = numpy.array(source, dtype=numpy.float64)
+        self._numpy_cache[key] = (size, converted)
+        return converted
 
     def null_mask(self, position: int) -> Any:
         """A boolean array that is ``True`` where the slot holds NULL."""
 
         if not fastpath.available():
             return None
-        flags = fastpath.load_fixed_column(self._nulls[position].path, "u1", self.slot_count)
+        flags = self._mapped(("null", position), self._nulls[position].path,
+                             "u1", self.slot_count)
         if flags is None:
             return None
         return flags.astype(bool)
@@ -492,7 +556,7 @@ class ColumnarStore:
 
         if not fastpath.available():
             return None
-        flags = fastpath.load_live_mask(self._live.path, self.slot_count)
+        flags = self._mapped(("live",), self._live.path, "u1", self.slot_count)
         if flags is None:
             return None
         return flags.astype(bool)
@@ -502,19 +566,47 @@ class ColumnarStore:
 
         if not fastpath.available():
             return None
-        return fastpath.load_fixed_column(self._pk.path, "<i8", self.slot_count)
+        return self._mapped(("pk",), self._pk.path, "<i8", self.slot_count)
 
-    def varchar_column_bytes(self, position: int) -> tuple[Any, Any, Any]:
-        """``(arena, offsets, lengths)`` for a VARCHAR column."""
+    def varchar_column_bytes(self, position: int, start: int = 0,
+                             end: int | None = None) -> tuple[Any, Any, Any]:
+        """``(arena, offsets, lengths)`` for a VARCHAR column.
+
+        When a slot range is given, only the arena bytes that the range
+        needs are read and the offsets are rebased to that slice, so a
+        chunked scan never holds the whole string column in memory.
+        """
 
         if not fastpath.available():
             return None, None, None
         count = self.slot_count
-        offsets = fastpath.load_fixed_column(self._offs[position].path, "<u8", count)
-        lengths = fastpath.load_fixed_column(self._lens[position].path, "<u4", count)
+        offsets = self._mapped(("off", position), self._offs[position].path,
+                               "<u8", count)
+        lengths = self._mapped(("len", position), self._lens[position].path,
+                               "<u4", count)
         if offsets is None or lengths is None:
             return None, None, None
-        return self._arena[position].read_all(), offsets, lengths
+        if end is None and start == 0:
+            return self._arena[position].read_all(), offsets, lengths
+
+        numpy = fastpath.module()
+        end = count if end is None else min(int(end), count)
+        start = max(0, min(int(start), end))
+        chunk_offsets = offsets[start:end]
+        chunk_lengths = lengths[start:end]
+        present = numpy.ones(chunk_offsets.shape[0], dtype=bool)
+        nulls = self.null_mask(position)
+        if nulls is not None:
+            present = ~nulls[start:end]
+        if not bool(present.any()):
+            return b"", chunk_offsets, chunk_lengths
+        starts = chunk_offsets[present]
+        ends = starts + chunk_lengths[present]
+        low = int(starts.min())
+        high = int(ends.max())
+        arena = self._arena[position].read(low, high - low)
+        rebased = chunk_offsets - low
+        return arena, rebased, chunk_lengths
 
     # -- writes ------------------------------------------------------------
     def put(self, pk: int, values: Sequence[Any]) -> None:
@@ -583,6 +675,7 @@ class ColumnarStore:
                 lens.sync()
 
     def close(self) -> None:
+        self._numpy_cache.clear()
         for handle in [self._pk, self._live, *self._arena, *self._nulls,
                        *(o for o in self._offs if o is not None),
                        *(l for l in self._lens if l is not None)]:

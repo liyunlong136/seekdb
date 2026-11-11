@@ -99,16 +99,28 @@ def parse_vector_literal(text: str) -> list[float]:
     return values
 
 
+# The largest finite float32.  ``array('f')`` silently turns an out-of-range
+# double into ``inf`` instead of raising, so the range has to be checked
+# before the value is packed.
+FLOAT32_MAX = 3.4028234663852886e+38
+
+
 def to_float32(values: Sequence[float]) -> array.array:
-    """Store vectors with float32 semantics, as the task requires."""
+    """Store vectors with float32 semantics, as the task requires.
+
+    A value that cannot be represented as a finite float32 is rejected:
+    NaN, Infinity and doubles outside the float32 range are all errors.
+    """
     out = array.array("f")
     for value in values:
+        value = float(value)
         if not math.isfinite(value):
             raise SqlError(INVALID_VECTOR, "vector contains NaN or Infinity")
-        try:
-            out.append(value)
-        except OverflowError:
-            raise SqlError(VALUE_OUT_OF_RANGE, "vector element overflows float32") from None
+        if value > FLOAT32_MAX or value < -FLOAT32_MAX:
+            raise SqlError(VALUE_OUT_OF_RANGE, "vector element overflows float32")
+        out.append(value)
+        if not math.isfinite(out[-1]):
+            raise SqlError(VALUE_OUT_OF_RANGE, "vector element overflows float32")
     if len(out) != len(values):
         raise SqlError(VALUE_OUT_OF_RANGE, "vector element overflows float32")
     return out

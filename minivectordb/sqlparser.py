@@ -29,6 +29,15 @@ TOKEN_RE = re.compile(r"""
   | (?P<punct><>|!=|<=|>=|:=|\(|\)|,|;|=|<|>|\*|\+|-|\[|\]|\.)
 """, re.VERBOSE | re.DOTALL)
 
+# A vector literal is scanned as one token instead of one token per number.
+# A query with a 128 dimension vector would otherwise cost hundreds of
+# regular expression matches and token objects before the executor sees it.
+VECTOR_RE = re.compile(
+    r"\[\s*[-+]?(?:\d+\.\d+(?:[eE][+-]?\d+)?|\.\d+(?:[eE][+-]?\d+)?|\d+(?:[eE][+-]?\d+)?)"
+    r"(?:\s*,\s*[-+]?(?:\d+\.\d+(?:[eE][+-]?\d+)?|\.\d+(?:[eE][+-]?\d+)?|\d+(?:[eE][+-]?\d+)?))*"
+    r"\s*\]"
+)
+
 KEYWORDS = {
     "SELECT", "FROM", "WHERE", "ORDER", "BY", "LIMIT", "INSERT", "INTO",
     "VALUES", "UPDATE", "SET", "DELETE", "CREATE", "TABLE", "INDEX", "ON",
@@ -55,6 +64,12 @@ def tokenize(sql: str) -> list[Token]:
     pos = 0
     length = len(sql)
     while pos < length:
+        if sql[pos] == "[":
+            vector = VECTOR_RE.match(sql, pos)
+            if vector:
+                tokens.append(Token("vector", _vector_values(vector.group()), pos))
+                pos = vector.end()
+                continue
         match = TOKEN_RE.match(sql, pos)
         if not match:
             raise SqlError(SYNTAX_ERROR, f"unexpected character at {pos}: {sql[pos]!r}")
@@ -78,6 +93,22 @@ def tokenize(sql: str) -> list[Token]:
             tokens.append(Token("punct", text, match.start()))
     tokens.append(Token("eof", None, length))
     return tokens
+
+
+def _vector_values(text: str) -> list[float]:
+    """The numbers of a vector literal, in the order they appear."""
+
+    body = text[1:-1]
+    values: list[float] = []
+    for token in body.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        try:
+            values.append(float(token))
+        except ValueError:
+            raise SqlError(SYNTAX_ERROR, "vector literal expects numbers") from None
+    return values
 
 
 def _decode_string(raw: str) -> str:
@@ -370,6 +401,9 @@ class Parser:
         if token.kind == "string":
             self.next()
             return ("str", token.value)
+        if token.kind == "vector":
+            self.next()
+            return ("vec", token.value)
         if self.at_punct("["):
             self.next()
             values: list[float] = []
@@ -459,6 +493,9 @@ class Parser:
         if token.kind == "string":
             self.next()
             return ("str", token.value)
+        if token.kind == "vector":
+            self.next()
+            return ("vec", token.value)
         if token.kind == "punct" and token.value == "[":
             return self.parse_literal()
         if token.kind == "ident":
