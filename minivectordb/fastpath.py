@@ -27,15 +27,31 @@ except ImportError:  # pragma: no cover - depends on the image
 NUMPY_AVAILABLE = _np is not None
 
 
+def _disabled() -> bool:
+    """Whether the vectorised path was switched off on purpose.
+
+    The Docker image falls back to the pure standard library path when numpy
+    cannot be installed at build time.  The environment variable makes that
+    fallback reproducible on a machine that does have numpy, so the two paths
+    can be compared.
+    """
+
+    return bool(os.environ.get("MINIVECTORDB_DISABLE_NUMPY"))
+
+
 def available() -> bool:
     """Whether the vectorised path can be used."""
 
+    if _disabled():
+        return False
     return NUMPY_AVAILABLE
 
 
 def module() -> Any:
     """The numpy module, or ``None`` when it is unavailable."""
 
+    if _disabled():
+        return None
     return _np
 
 
