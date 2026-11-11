@@ -133,6 +133,19 @@ python3 protocol_check/run.py --image minivectordb:local --output protocol-resul
 
 `protocol_check/run.py` 的进程模式（`--command`）只支持 POSIX；Windows 上可用 `python3 main.py` 手工驱动同样的 JSONL 协议。
 
+### 一键复验（需要 Docker）
+
+仓库根目录带了一个 `verify_docker.sh`，在 WSL2 里执行即可把提测前的容器层复验一次跑完：
+
+```bash
+bash verify_docker.sh                 # 构建镜像 + 官方握手 + 官方公开用例
+bash verify_docker.sh myimage:tag     # 指定镜像名
+```
+
+它依次做四件事：从当前仓库源码构建镜像；用官方 `protocol_check/run.py` 跑握手检查与全部公开用例；
+按 `STDIO_PROTOCOL.md` 第 7 节跑一次带 `--read-only --network=none --cap-drop=ALL` 约束的容器自测；
+最后做一次强杀恢复 —— 容器被 kill 后重启，已提交的数据必须还在。
+
 ## 六、目录结构
 
 ```
