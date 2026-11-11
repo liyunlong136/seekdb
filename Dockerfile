@@ -15,7 +15,9 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     VECTORDB_DATA_DIR=/data
 
-RUN pip install --no-cache-dir --disable-pip-version-check "numpy==2.2.3" \
+# numpy 2.2.3 提供 cp312 的 manylinux_2_17_x86_64 wheel，--only-binary  保证 pip
+# 不会退化成源码编译（镜像里没有编译器，源码编译必然失败并浪费构建时间）。
+RUN pip install --no-cache-dir --disable-pip-version-check --only-binary=:all: "numpy==2.2.3" \
     || echo "numpy unavailable, falling back to the pure standard library path"
 
 WORKDIR /app
