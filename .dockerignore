@@ -1,28 +1,10 @@
-.git
-.github
-.agents
-.venv
-**/.venv
-.tox
-.pytest_cache
-**/.pytest_cache
-.ruff_cache
-**/.ruff_cache
-.mypy_cache
-.powercontext
-__pycache__
-**/__pycache__
-*.py[cod]
-*.db
-*.sqlite*
-.env
-.env.*
-build
-dist
-site
-docs
-integrations/*
-!integrations/bub
-!integrations/bub/**
-openapi
-tests
+# Keep the Docker build context minimal.  The image only needs main.py and the
+# minivectordb package; this repository also carries a large C++ source tree
+# that must not be uploaded to the builder as build context.
+*
+!main.py
+!minivectordb
+!minivectordb/**
+
+__pycache__/
+*.pyc
