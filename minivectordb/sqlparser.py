@@ -43,8 +43,17 @@ KEYWORDS = {
     "VALUES", "UPDATE", "SET", "DELETE", "CREATE", "TABLE", "INDEX", "ON",
     "BEGIN", "COMMIT", "ROLLBACK", "AND", "OR", "NOT", "NULL", "IS", "AS",
     "ASC", "DESC", "PRIMARY", "KEY", "BIGINT", "VARCHAR", "VECTOR", "IN",
-    "START", "TRANSACTION", "WORK", "REPLACE", "INTO",
+    "START", "TRANSACTION", "WORK", "REPLACE", "INTO", "DROP", "OFFSET",
 }
+
+#: Aggregate functions are one of the statement kinds the task lists as
+#: unsupported.  They are recognised by name so that the statement fails with
+#: the agreed error instead of a generic syntax error.
+AGGREGATE_FUNCTIONS = {"COUNT", "SUM", "AVG", "MIN", "MAX", "GROUP_CONCAT"}
+
+#: Words that introduce a join.  A join is not part of the supported subset.
+JOIN_WORDS = {"JOIN", "INNER", "LEFT", "RIGHT", "FULL", "CROSS", "NATURAL",
+              "STRAIGHT_JOIN"}
 
 
 class Token:
@@ -205,6 +214,8 @@ class Parser:
             return self.parse_update()
         if word == "DELETE":
             return self.parse_delete()
+        if word == "DROP":
+            return self.parse_drop()
         if word == "SELECT":
             return self.parse_select()
         if word in ("BEGIN", "START"):
@@ -271,6 +282,11 @@ class Parser:
                 else:
                     raise SqlError(UNSUPPORTED_SQL, f"{type_name} does not take a length")
                 self.expect_punct(")")
+            # A foreign key is one of the statement kinds the task lists as
+            # unsupported.
+            token = self.peek()
+            if token.kind in ("keyword", "ident") and str(token.value).upper() == "REFERENCES":
+                raise SqlError(UNSUPPORTED_SQL, "foreign keys are not supported")
             primary = False
             if self.at_keyword("PRIMARY"):
                 self.next()
@@ -301,6 +317,11 @@ class Parser:
                 if not self.eat_punct(","):
                     break
             self.expect_punct(")")
+        if self.at_keyword("SELECT"):
+            # INSERT INTO t [(cols)] SELECT ... FROM other
+            source = self.parse_select()
+            return {"kind": "insert_select", "table": table, "columns": columns,
+                    "select": source}
         self.expect_keyword("VALUES")
         rows: list[list[Any]] = []
         while True:
@@ -344,6 +365,26 @@ class Parser:
         self.eat_punct(";")
         return {"kind": "delete", "table": table, "where": where}
 
+    def parse_drop(self) -> dict:
+        self.expect_keyword("DROP")
+        if self.at_keyword("TABLE"):
+            self.next()
+            if self.at_keyword("IF"):
+                self.next()
+                self.expect_keyword("EXISTS")
+            table = self.identifier()
+            self.eat_punct(";")
+            return {"kind": "drop_table", "table": table}
+        if self.at_keyword("VECTOR", "INDEX"):
+            self.eat_keyword("VECTOR", "INDEX")
+            name = self.identifier()
+            table = None
+            if self.eat_keyword("ON"):
+                table = self.identifier()
+            self.eat_punct(";")
+            return {"kind": "drop_index", "name": name, "table": table}
+        raise SqlError(UNSUPPORTED_SQL, f"unsupported DROP near {self.peek().value!r}")
+
     def parse_select(self) -> dict:
         self.expect_keyword("SELECT")
         items: list[dict] = []
@@ -360,6 +401,7 @@ class Parser:
                     break
         self.expect_keyword("FROM")
         table = self.identifier()
+        self._reject_join()
         where = None
         if self.eat_keyword("WHERE"):
             where = self.parse_expression()
@@ -377,14 +419,31 @@ class Parser:
                 if not self.eat_punct(","):
                     break
         limit = None
+        offset = 0
         if self.eat_keyword("LIMIT"):
             token = self.next()
             if token.kind != "number" or not isinstance(token.value, int):
                 raise SqlError(SYNTAX_ERROR, "LIMIT expects an integer")
             limit = token.value
+            if self.eat_keyword("OFFSET"):
+                token = self.next()
+                if token.kind != "number" or not isinstance(token.value, int):
+                    raise SqlError(SYNTAX_ERROR, "OFFSET expects an integer")
+                offset = token.value
         self.eat_punct(";")
         return {"kind": "select", "items": items, "table": table, "where": where,
-                "order": order, "limit": limit}
+                "order": order, "limit": limit, "offset": offset}
+
+    def _reject_join(self) -> None:
+        """A join is not part of the supported subset.
+
+        The check looks at the token text, so it also catches the qualifiers
+        (``INNER``, ``LEFT``, ...) that precede the join keyword.
+        """
+
+        token = self.peek()
+        if token.kind in ("keyword", "ident") and str(token.value).upper() in JOIN_WORDS:
+            raise SqlError(UNSUPPORTED_SQL, "joins are not supported")
 
     # -- expressions
     def parse_literal(self) -> Any:
@@ -449,12 +508,12 @@ class Parser:
         return self.parse_comparison()
 
     def parse_comparison(self) -> Any:
-        left = self.parse_primary()
+        left = self.parse_additive()
         token = self.peek()
         if token.kind == "punct" and token.value in ("=", "<>", "!=", "<", "<=", ">", ">="):
             self.next()
             op = "!=" if token.value == "!=" else token.value
-            right = self.parse_primary()
+            right = self.parse_additive()
             return ("binop", op, left, right)
         if self.at_keyword("IS"):
             self.next()
@@ -473,6 +532,18 @@ class Parser:
             self.expect_punct(")")
             return ("in", left, items)
         return left
+
+    def parse_additive(self) -> Any:
+        """Addition and subtraction, e.g. ``SET value = value + 1``."""
+
+        left = self.parse_primary()
+        while True:
+            token = self.peek()
+            if token.kind != "punct" or token.value not in ("+", "-"):
+                return left
+            self.next()
+            right = self.parse_primary()
+            left = ("arith", token.value, left, right)
 
     def parse_primary(self) -> Any:
         token = self.peek()
@@ -502,6 +573,11 @@ class Parser:
             name = str(token.value)
             self.next()
             if self.at_punct("("):
+                if name.upper() in AGGREGATE_FUNCTIONS:
+                    # An aggregate is one of the statement kinds the task lists
+                    # as unsupported.
+                    raise SqlError(UNSUPPORTED_SQL,
+                                   f"aggregate function {name.upper()} is not supported")
                 self.next()
                 args: list[Any] = []
                 if not self.at_punct(")"):

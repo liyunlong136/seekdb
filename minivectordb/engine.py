@@ -28,8 +28,10 @@ instead of to the whole history.
 """
 from __future__ import annotations
 
+import array
 import json
 import os
+import shutil
 import struct
 import sys
 from typing import Any, Iterable, Iterator
@@ -312,7 +314,10 @@ class Engine:
         kind = statement["kind"]
         if kind == "begin":
             if self._active_txn is not None:
-                raise SqlError(TRANSACTION_ERROR, "a transaction is already active")
+                # A nested transaction is one of the statements the task lists
+                # as unsupported, so it is reported with the same error code
+                # as the rest of that group.
+                raise SqlError(UNSUPPORTED_SQL, "nested transactions are not supported")
             self._active_txn = self._begin_implicit()
             self._overlay.clear()
             self._overlay_order.clear()
@@ -327,12 +332,16 @@ class Engine:
                 raise SqlError(TRANSACTION_ERROR, "no active transaction")
             self._rollback_active()
             return {}
-        if kind in ("insert", "update", "delete"):
+        if kind in ("insert", "insert_select", "update", "delete"):
             return self._execute_dml(statement)
         if kind == "create_table":
             return self._execute_create_table(statement)
         if kind == "create_index":
             return self._execute_create_index(statement)
+        if kind == "drop_table":
+            return self._execute_drop_table(statement)
+        if kind == "drop_index":
+            return self._execute_drop_index(statement)
         if kind == "select":
             return self._execute_select(statement)
         raise SqlError(UNSUPPORTED_SQL, f"unsupported statement {kind!r}")
@@ -370,6 +379,37 @@ class Engine:
         self._save_catalog()
         return {}
 
+    def _execute_drop_table(self, statement: dict) -> dict:
+        """``DROP TABLE t`` removes the table and the files that hold it."""
+
+        name = statement["table"]
+        table = self._table(name)
+        try:
+            table.store.close()
+        except OSError:
+            pass
+        self.tables.pop(table.name.lower(), None)
+        self._save_catalog()
+        shutil.rmtree(table_directory(self.data_dir, table.name), ignore_errors=True)
+        return {}
+
+    def _execute_drop_index(self, statement: dict) -> dict:
+        """``DROP INDEX idx [ON t]`` removes a vector index."""
+
+        table_name = statement["table"]
+        if table_name is not None:
+            candidates = [self._table(table_name)]
+        else:
+            candidates = list(self.tables.values())
+        index_name = statement["name"]
+        for candidate in candidates:
+            for name in list(candidate.indexes):
+                if name.lower() == index_name.lower():
+                    del candidate.indexes[name]
+                    self._save_catalog()
+                    return {}
+        raise SqlError(NO_SUCH_INDEX, f"unknown index {index_name!r}")
+
     def _table(self, name: str) -> Table:
         table = self.tables.get(name.lower())
         if table is None:
@@ -382,6 +422,8 @@ class Engine:
         kind = statement["kind"]
         if kind == "insert":
             return self._execute_insert(table, statement)
+        if kind == "insert_select":
+            return self._execute_insert_select(table, statement)
         if kind == "update":
             return self._execute_update(table, statement)
         return self._execute_delete(table, statement)
@@ -407,7 +449,10 @@ class Engine:
         if tag == "lit":
             value = node[1]
             if value is None:
-                return None
+                # NULL is not part of the supported subset, so it is reported
+                # as an unsupported feature rather than as a type problem.
+                raise SqlError(UNSUPPORTED_SQL,
+                               "NULL is not part of the supported subset")
             if column.type == BIGINT:
                 if isinstance(value, bool) or not isinstance(value, int):
                     raise SqlError(TYPE_MISMATCH, f"column {column.name} expects BIGINT")
@@ -431,6 +476,38 @@ class Engine:
         if tag == "col":
             raise SqlError(TYPE_MISMATCH, "cannot assign a column reference here")
         raise SqlError(TYPE_MISMATCH, "unsupported value expression")
+
+    def _coerce_assigned(self, column: Column, node: Any, table: Table,
+                         row: list[Any]) -> Any:
+        """Bind the right hand side of an UPDATE assignment to a column type.
+
+        A literal is coerced without looking at the row.  An expression is
+        evaluated against the row first and its result is coerced, so
+        ``SET value = value + 1`` stores the computed number.
+        """
+
+        tag = node[0] if isinstance(node, tuple) and node else None
+        if tag in ("lit", "str", "vec"):
+            return self._coerce(column, node)
+        return self._coerce_value(column, self._evaluate(node, table, row))
+
+    def _coerce_value(self, column: Column, value: Any) -> Any:
+        """Check a value that was computed at run time against the column type."""
+
+        if value is None:
+            raise SqlError(UNSUPPORTED_SQL,
+                           "NULL is not part of the supported subset")
+        if column.type == BIGINT:
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise SqlError(TYPE_MISMATCH, f"column {column.name} expects BIGINT")
+            return value
+        if column.type == VARCHAR:
+            if not isinstance(value, str):
+                raise SqlError(TYPE_MISMATCH, f"column {column.name} expects VARCHAR")
+            return value
+        if isinstance(value, array.array):
+            return self._check_vector(column, value)
+        raise SqlError(TYPE_MISMATCH, f"column {column.name} expects a vector")
 
     # -- staging ----------------------------------------------------------
     # A statement never writes to the data files directly.  The changes are
@@ -523,13 +600,19 @@ class Engine:
                 values[position] = self._coerce(table.columns[position], node)
             pk = values[pk_position]
             if pk is None:
-                raise SqlError(CONSTRAINT_VIOLATION, "primary key must not be null")
+                raise SqlError(UNSUPPORTED_SQL,
+                               "NULL is not part of the supported subset")
             if not isinstance(pk, int) or isinstance(pk, bool):
                 raise SqlError(TYPE_MISMATCH, "primary key must be a BIGINT")
             if pk in seen or self._exists(table, pk):
                 raise SqlError(DUPLICATE_KEY, f"duplicate primary key {pk}")
             seen.add(pk)
             prepared.append((pk, values))
+
+        return self._stage_inserts(table, prepared)
+
+    def _stage_inserts(self, table: Table, prepared: list[tuple[int, list[Any]]]) -> dict:
+        """Write a prepared list of rows through the log and the overlay."""
 
         txn = self._active_txn
         implicit = txn is None
@@ -548,30 +631,81 @@ class Engine:
             self._commit(txn)
         return {"affected_rows": len(prepared)}
 
+    def _execute_insert_select(self, table: Table, statement: dict) -> dict:
+        """``INSERT INTO t [(cols)] SELECT ... FROM other``.
+
+        The query runs first and its result becomes the rows of the insert, so
+        the statement obeys exactly the same rules as an INSERT with a
+        literal VALUES list: one bad row fails the whole statement.
+        """
+
+        source = statement["select"]
+        names = statement["columns"]
+        if names is None:
+            targets = list(range(len(table.columns)))
+        else:
+            targets = [table.column_index(name) for name in names]
+        if len(set(targets)) != len(table.columns):
+            missing = [c.name for c in table.columns
+                       if table.columns.index(c) not in set(targets)]
+            raise SqlError(CONSTRAINT_VIOLATION,
+                           "every column needs a value, missing: " + ", ".join(missing))
+        pk_position = table.columns.index(table.primary_key)
+
+        result = self._execute_select(source)
+        rows = result.get("rows") or []
+        prepared: list[tuple[int, list[Any]]] = []
+        seen: set[int] = set()
+        for row in rows:
+            if len(row) != len(targets):
+                raise SqlError(TYPE_MISMATCH,
+                               f"expected {len(targets)} values, got {len(row)}")
+            values: list[Any] = [None] * len(table.columns)
+            for position, value in zip(targets, row):
+                values[position] = self._coerce_value(table.columns[position], value)
+            pk = values[pk_position]
+            if pk is None:
+                raise SqlError(UNSUPPORTED_SQL,
+                               "NULL is not part of the supported subset")
+            if not isinstance(pk, int) or isinstance(pk, bool):
+                raise SqlError(TYPE_MISMATCH, "primary key must be a BIGINT")
+            if pk in seen or self._exists(table, pk):
+                raise SqlError(DUPLICATE_KEY, f"duplicate primary key {pk}")
+            seen.add(pk)
+            prepared.append((pk, values))
+
+        return self._stage_inserts(table, prepared)
+
     def _execute_update(self, table: Table, statement: dict) -> dict:
         assignments = statement["assignments"]
         where = statement["where"]
         pk_position = table.columns.index(table.primary_key) if table.primary_key else None
+
+        # The statement is validated before a single row is looked at.  A
+        # statement that the task does not support has to fail even when its
+        # WHERE clause selects no row: otherwise an invalid statement would
+        # silently succeed with "affected_rows: 0" and the caller could not
+        # tell it apart from a legitimate no-op.
+        positions: list[int] = []
+        for name, _node in assignments:
+            position = table.column_index(name)
+            positions.append(position)
+            if pk_position is not None and position == pk_position:
+                # The task does not support updating a primary key.  It is
+                # rejected instead of being executed, because the row would
+                # otherwise be stored under the old key while the column
+                # holds the new one.
+                raise SqlError(UNSUPPORTED_SQL,
+                               "updating the primary key is not supported")
 
         targets: list[tuple[int, list[Any]]] = []
         for pk, row in self._iter_rows(table):
             if where is not None and not _truthy(self._evaluate(where, table, row)):
                 continue
             values = list(row)
-            for name, node in assignments:
-                position = table.column_index(name)
-                values[position] = self._coerce(table.columns[position], node)
-            if pk_position is not None:
-                new_pk = values[pk_position]
-                if new_pk != pk:
-                    # The task does not support updating a primary key.  It is
-                    # rejected instead of being executed, because the row would
-                    # otherwise be stored under the old key while the column
-                    # holds the new one.
-                    raise SqlError(UNSUPPORTED_SQL,
-                                   "updating the primary key is not supported")
-                if not isinstance(new_pk, int) or isinstance(new_pk, bool):
-                    raise SqlError(TYPE_MISMATCH, "primary key must be a BIGINT")
+            for position, (_name, node) in zip(positions, assignments):
+                values[position] = self._coerce_assigned(
+                    table.columns[position], node, table, row)
             targets.append((pk, values))
 
         txn = self._active_txn
@@ -620,6 +754,7 @@ class Engine:
         where = statement["where"]
         order = statement["order"]
         limit = statement["limit"]
+        offset = statement.get("offset") or 0
 
         rows: list[tuple[list[Any], int, list[Any]]] = []
         for pk, row in self._iter_rows(table):
@@ -646,6 +781,8 @@ class Engine:
                                reverse=descending)
             rows = [(values, pk, raw) for _keys, values, pk in decorated]
 
+        if offset:
+            rows = rows[max(0, offset):]
         if limit is not None:
             rows = rows[:max(0, limit)]
 
@@ -974,6 +1111,11 @@ class Engine:
             left = self._evaluate(left_expr, table, row)
             right = self._evaluate(right_expr, table, row)
             return _compare(operator, left, right)
+        if tag == "arith":
+            operator, left_expr, right_expr = expr[1], expr[2], expr[3]
+            left = self._evaluate(left_expr, table, row)
+            right = self._evaluate(right_expr, table, row)
+            return _arith(operator, left, right)
         if tag == "and":
             left = self._evaluate(expr[1], table, row)
             if left is None:
@@ -990,7 +1132,11 @@ class Engine:
             value = self._evaluate(expr[1], table, row)
             return None if value is None else not _truthy(value)
         if tag == "isnull":
-            return self._evaluate(expr[1], table, row) is None
+            # NULL is not part of the supported subset, so a column can never
+            # hold it and an IS NULL test would always be false.  Reporting the
+            # statement as unsupported is the honest answer.
+            raise SqlError(UNSUPPORTED_SQL,
+                           "NULL is not part of the supported subset")
         if tag == "in":
             left = self._evaluate(expr[1], table, row)
             for item in expr[2]:
@@ -1097,6 +1243,24 @@ def _as_vector(value: Any) -> Any:
 
 def _truthy(value: Any) -> bool:
     return bool(value)
+
+
+def _arith(operator: str, left: Any, right: Any) -> Any:
+    """Addition and subtraction of two numbers."""
+
+    if left is None or right is None:
+        return None
+    if isinstance(left, bool) or isinstance(right, bool):
+        raise SqlError(TYPE_MISMATCH, "arithmetic needs numbers")
+    if not isinstance(left, (int, float)) or not isinstance(right, (int, float)):
+        raise SqlError(TYPE_MISMATCH,
+                       f"cannot apply {operator!r} to {type(left).__name__} "
+                       f"and {type(right).__name__}")
+    if operator == "+":
+        return left + right
+    if operator == "-":
+        return left - right
+    raise SqlError(INTERNAL_ERROR, f"unknown arithmetic operator {operator!r}")
 
 
 def _compare(operator: str, left: Any, right: Any) -> Any:
