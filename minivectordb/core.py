@@ -171,7 +171,11 @@ def encode_value(column: Column, value: Any) -> bytes:
         if not isinstance(value, str):
             raise SqlError(TYPE_MISMATCH, f"column {column.name} expects VARCHAR")
         encoded = value.encode("utf-8")
-        if column.length is not None and len(encoded) > column.length:
+        # The declared length counts Unicode characters, not bytes: a
+        # VARCHAR(16) holds sixteen Chinese characters, whose UTF-8 form is
+        # 48 bytes long.  Counting bytes would reject a value the schema
+        # accepts.
+        if column.length is not None and len(value) > column.length:
             raise SqlError(VALUE_OUT_OF_RANGE,
                            f"value too long for {column.name} VARCHAR({column.length})")
         return bytes([TAG_VARCHAR]) + _LENGTH.pack(len(encoded)) + encoded
