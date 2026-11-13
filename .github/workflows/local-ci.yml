@@ -206,8 +206,12 @@ jobs:
             echo "exit=$?"
           }
           printf 'id,name,score\n1,alpha,1.5\n2,beta,2.5\n' > /tmp/basic.csv
+          printf 'id,name,score,active,day\n1,Alice,98.5,1,2026-08-01\n2,Bob,87,0,\n' > /tmp/basic2.csv
           probe "switch off: expect ERROR 1235" "select count(*) from read_csv('/tmp/basic.csv')"
-          probe "switch on: expect ERROR 1235 for now" "set session enable_file_sql=on; select count(*) from read_csv('/tmp/basic.csv')"
+          probe "switch on: expect the rows" "set session enable_file_sql=on; select id, name, score from read_csv('/tmp/basic.csv') f order by id"
+          probe "aggregate: expect 3 rows and the sum" "set session enable_file_sql=on; select count(*) as c, sum(id) as s from read_csv('/tmp/basic.csv') f"
+          probe "types: expect int, varchar and double" "set session enable_file_sql=on; select id, name, score from read_csv('/tmp/basic2.csv') f order by id"
+          probe "null and date: expect NULL for the empty day" "set session enable_file_sql=on; select id, day from read_csv('/tmp/basic2.csv') f order by id"
           probe "legacy 2nd positional: expect ERROR 1064" "select * from read_csv('/tmp/basic.csv', 'xml')"
           probe "unknown named param parses: expect ERROR 1235" "select * from read_csv('/tmp/basic.csv', sample_size = 10)"
 

@@ -4483,7 +4483,7 @@ int ObDMLResolver::resolve_read_csv_item(const ParseNode &parse_tree, TableItem 
   } else if (3 != parse_tree.num_child_ || OB_ISNULL(parse_tree.children_[0])) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("unexpected read_csv expression", K(parse_tree.num_child_));
-  } else if (OB_FAIL(resolve_read_csv_options(*parse_tree.children_[1], options))) {
+  } else if (OB_FAIL(resolve_read_csv_options(parse_tree.children_[1], options))) {
     LOG_WARN("failed to resolve the read_csv options", K(ret));
   } else if (OB_FAIL(resolve_str_const(*parse_tree.children_[0], path))) {
     ret = OB_INVALID_ARGUMENT;
@@ -4544,7 +4544,8 @@ int ObDMLResolver::resolve_read_csv_item(const ParseNode &parse_tree, TableItem 
           }
           default: {
             res_type.set_type(ObVarcharType);
-            res_type.set_collation_type(ObCharset::get_default_collation_type());
+            res_type.set_collation_type(
+                ObCharset::get_default_collation(ObCharset::get_default_charset()));
             break;
           }
         }
@@ -4649,7 +4650,7 @@ int ObDMLResolver::resolve_read_csv_item(const ParseNode &parse_tree, TableItem 
   return ret;
 }
 
-int ObDMLResolver::resolve_read_csv_options(const ParseNode &param_node, csv_scan::CsvOptions &options)
+int ObDMLResolver::resolve_read_csv_options(const ParseNode *param_node, csv_scan::CsvOptions &options)
 {
   int ret = OB_SUCCESS;
   const ParseNode *param = NULL;
