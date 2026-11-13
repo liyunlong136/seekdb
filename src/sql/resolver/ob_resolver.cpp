@@ -482,6 +482,15 @@ int ObResolver::resolve(IsPrepared if_prepared, const ParseNode &parse_tree, ObS
           // DESCRIBE <select> prints the schema the file table function inferred
           ret = stmt_resolver_func<ObFileDescribeResolver>(
                   params_, *real_parse_tree->children_[4], stmt);
+          if (OB_SUCC(ret)) {
+            // the statement that comes out is a plain select, the session must
+            // not keep reporting the explain type to the executor
+            params_.session_info_->set_stmt_type(stmt::T_SELECT);
+            ObExecContext *exec_ctx = params_.session_info_->get_cur_exec_ctx();
+            if (NULL != exec_ctx && NULL != exec_ctx->get_sql_ctx()) {
+              exec_ctx->get_sql_ctx()->stmt_type_ = stmt::T_SELECT;
+            }
+          }
         } else {
           REGISTER_STMT_RESOLVER(Explain);
         }

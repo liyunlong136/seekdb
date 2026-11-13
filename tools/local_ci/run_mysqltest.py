@@ -86,12 +86,16 @@ def expand(text, variables, _depth=0):
 
 def resolve_let_value(value, variables):
     """Resolve the right hand side of a ``let`` statement."""
-    value = value.strip().strip("'\"")
+    value = value.strip()
     if value.endswith(";"):
-        value = value[:-1].strip()
+        value = value[:-1].rstrip()
     if value.startswith("query_get_value("):
         # the suites only read the connection host that way, a local run has one
         return os.environ.get("SEEKDB_HOST", "127.0.0.1")
+    # only a value that is wrapped in a matching pair of quotes loses them, a
+    # shell command that merely ends with a quote keeps it
+    if len(value) >= 2 and value[0] in "'\"" and value[-1] == value[0]:
+        value = value[1:-1]
     return expand(value, variables)
 
 
