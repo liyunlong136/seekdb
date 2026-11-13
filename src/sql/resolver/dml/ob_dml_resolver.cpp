@@ -4463,6 +4463,7 @@ int ObDMLResolver::resolve_read_csv_item(const ParseNode &parse_tree, TableItem 
   csv_scan::CsvOptions options;
   ObVector<csv_scan::CsvColumn> columns;
   ObVector<csv_scan::CsvCell> cells;
+  ObVector<char> nullable_columns;
   int64_t row_cnt = 0;
   int64_t column_cnt = 0;
   TableItem *item = NULL;
@@ -4564,49 +4565,61 @@ int ObDMLResolver::resolve_read_csv_item(const ParseNode &parse_tree, TableItem 
       }
     }
     if (OB_SUCC(ret)) {
+      for (int64_t i = 0; OB_SUCC(ret) && i < column_cnt; ++i) {
+        if (OB_FAIL(nullable_columns.push_back(0))) {
+          LOG_WARN("failed to add a nullable column", K(ret));
+        }
+      }
+    }
+    if (OB_SUCC(ret)) {
       for (int64_t i = 0; OB_SUCC(ret) && i < cells.size(); ++i) {
         ObObj value;
         const csv_scan::CsvCell &cell = cells.at(i);
         const ObRawExprResType &res_type = table_def->column_types_.at(i % (column_cnt > 0 ? column_cnt : 1));
-        if (cell.is_null_) {
-          value.set_null();
-        } else if (ObTinyIntType == res_type.get_type()) {
+        if (ObTinyIntType == res_type.get_type()) {
           bool bool_value = false;
-          if (csv_scan::csv_try_bool(cell.data_, cell.len_, bool_value)) {
+          if (!cell.is_null_ && csv_scan::csv_try_bool(cell.data_, cell.len_, bool_value)) {
             value.set_tinyint_value(static_cast<int8_t>(bool_value ? 1 : 0));
           } else {
-            value.set_null();
+            value.set_tinyint_value(0);
           }
         } else if (ObIntType == res_type.get_type()) {
           int64_t int_value = 0;
-          if (csv_scan::csv_try_int64(cell.data_, cell.len_, int_value)) {
+          if (!cell.is_null_ && csv_scan::csv_try_int64(cell.data_, cell.len_, int_value)) {
             value.set_int_value(int_value);
           } else {
-            value.set_null();
+            value.set_int_value(0);
           }
         } else if (ObDoubleType == res_type.get_type()) {
           double double_value = 0;
-          if (csv_scan::csv_try_double(cell.data_, cell.len_, double_value)) {
+          if (!cell.is_null_ && csv_scan::csv_try_double(cell.data_, cell.len_, double_value)) {
             value.set_double_value(double_value);
           } else {
-            value.set_null();
+            value.set_double_value(0);
           }
         } else if (ObDateType == res_type.get_type()) {
           int32_t date_value = 0;
-          if (csv_scan::csv_try_date(cell.data_, cell.len_, date_value)) {
+          if (!cell.is_null_ && csv_scan::csv_try_date(cell.data_, cell.len_, date_value)) {
             value.set_date_value(date_value);
           } else {
-            value.set_null();
+            value.set_date_value(0);
           }
         } else if (ObDateTimeType == res_type.get_type()) {
           int64_t datetime_value = 0;
-          if (csv_scan::csv_try_datetime(cell.data_, cell.len_, datetime_value)) {
+          if (!cell.is_null_ && csv_scan::csv_try_datetime(cell.data_, cell.len_, datetime_value)) {
             value.set_datetime_value(datetime_value);
           } else {
-            value.set_null();
+            value.set_datetime_value(0);
           }
         } else {
           value.set_varchar(cell.data_, static_cast<ObString::obstr_size_t>(cell.len_));
+        }
+        if (cell.is_null_) {
+          // the value keeps the type of the column, only the null flag is set
+          value.set_null();
+          if (column_cnt > 0) {
+            nullable_columns.at(i % column_cnt) = 1;
+          }
         }
         // the rows are handed over as constant expressions, exactly like the
         // rows of a values table that comes from the parser
@@ -4636,6 +4649,10 @@ int ObDMLResolver::resolve_read_csv_item(const ParseNode &parse_tree, TableItem 
         }
       }
     }
+    if (OB_SUCC(ret) && OB_FAIL(stmt->add_table_item(session_info_, item))) {
+      LOG_USER_ERROR(OB_INVALID_ARGUMENT, "read_csv(), cannot add the table item");
+      LOG_WARN("failed to add the table item", K(ret));
+    }
     if (OB_SUCC(ret)) {
       for (int64_t i = 0; OB_SUCC(ret) && i < column_cnt; ++i) {
         ObColumnRefRawExpr *column_expr = NULL;
@@ -4646,6 +4663,10 @@ int ObDMLResolver::resolve_read_csv_item(const ParseNode &parse_tree, TableItem 
           LOG_WARN("the column expression is null", K(ret));
         } else {
           column_expr->set_result_type(table_def->column_types_.at(i));
+          // a column is nullable as soon as one of its values is null
+          if (nullable_columns.at(i)) {
+            column_expr->set_result_flag(IS_NULL);
+          }
           column_expr->set_ref_id(item->table_id_, i + OB_APP_MIN_COLUMN_ID);
           column_expr->set_column_attr(item->table_name_, columns.at(i).name_);
           if (OB_FAIL(column_expr->add_flag(IS_COLUMN))) {
@@ -4664,10 +4685,6 @@ int ObDMLResolver::resolve_read_csv_item(const ParseNode &parse_tree, TableItem 
           }
         }
       }
-    }
-    if (OB_SUCC(ret) && OB_FAIL(stmt->add_table_item(session_info_, item))) {
-      LOG_USER_ERROR(OB_INVALID_ARGUMENT, "read_csv(), cannot add the table item");
-      LOG_WARN("failed to add the table item", K(ret));
     }
     table_item = item;
   }
