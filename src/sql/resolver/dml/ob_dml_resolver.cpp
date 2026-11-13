@@ -4117,7 +4117,9 @@ inline bool csv_try_date(const char *data, int64_t len, int32_t &days)
 
 inline bool csv_try_datetime(const char *data, int64_t len, int64_t &usec)
 {
-  if (len < 19 || ' ' != data[10] || ':' != data[13] || ':' != data[16]) {
+  // the iso 8601 form separates the date and the time with a T
+  if (len < 19 || (' ' != data[10] && 'T' != data[10] && 't' != data[10])
+      || ':' != data[13] || ':' != data[16]) {
     return false;
   }
   int32_t days = 0;
@@ -4214,6 +4216,35 @@ struct CsvRecord
   std::vector<std::string> values_;
   std::vector<char> quoted_;
 };
+
+// a duplicate header is disambiguated the way duckdb does it: id, id__2, id__3
+inline void csv_dedup_headers(std::vector<std::string> &headers)
+{
+  std::vector<std::string> accepted;
+  for (size_t i = 0; i < headers.size(); ++i) {
+    const std::string base = headers[i];
+    std::string name = base;
+    int64_t suffix = 2;
+    bool exists = true;
+    while (exists) {
+      exists = false;
+      for (size_t j = 0; j < accepted.size(); ++j) {
+        if (accepted[j] == name) {
+          exists = true;
+          break;
+        }
+      }
+      if (exists) {
+        char buffer[32];
+        snprintf(buffer, sizeof(buffer), "__%ld", static_cast<long>(suffix));
+        name = base + buffer;
+        suffix++;
+      }
+    }
+    accepted.push_back(name);
+  }
+  headers.swap(accepted);
+}
 
 // read one record, the fields are separated by the delimiter and a field may
 // be quoted, a quoted field may contain the delimiter, a line break and the
@@ -4339,6 +4370,7 @@ inline int csv_read_file(const ObString &path, const CsvOptions &options, ObIAll
       return OB_SUCCESS;
     }
     headers = record.values_;
+    csv_dedup_headers(headers);
   }
   while (true) {
     const int read_ret = csv_read_record(content, pos, options, record);

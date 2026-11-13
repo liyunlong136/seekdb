@@ -205,7 +205,9 @@ def format_value(value):
 def render(statement, columns, rows, error=None):
     out = []
     if statement.result_log:
-        out.append(statement.text)
+        # the reference transcript echoes every line of a statement as its own
+        # line, so a multi line statement must not be one transcript element
+        out.extend(statement.text.splitlines())
         if error is None:
             if columns:
                 out.append("\t".join(str(c) for c in columns))
