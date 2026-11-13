@@ -6299,6 +6299,10 @@ int ObDMLResolver::resolve_read_csv_item(const ParseNode &parse_tree, TableItem 
   }
   if (OB_SUCC(ret)) {
     table_item = item;
+    LOG_INFO("FILESQL-STEP-1 the file table is resolved", K(ret),
+             "column_cnt", column_cnt, "row_cnt", row_cnt,
+             "cells", cells.size());  } else {
+    LOG_WARN("FILESQL-STEP-1 the file table is not resolved", K(ret), K(path));
   }
   return ret;
 }

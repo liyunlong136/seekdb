@@ -86,6 +86,8 @@ int ObLogValuesTableAccess::est_cost()
   double cost = 0.0;
   EstimateCostInfo param;
   param.need_parallel_ = get_parallel();
+  LOG_INFO("FILESQL-STEP-3 estimate the cost of the values table access",
+           "table_id", table_id_, "has_table_def", (NULL != table_def_));
   if (OB_FAIL(do_re_est_cost(param, card, op_cost, cost))) {
   } else {
     set_card(card);
@@ -147,6 +149,8 @@ int ObLogValuesTableAccess::get_plan_item_info(PlanText &plan_text,
                                         ObSqlPlanItem &plan_item)
 {
   int ret = OB_SUCCESS;
+  LOG_INFO("FILESQL-STEP-5 print the values table access node",
+           "column_cnt", column_exprs_.count());
   if (OB_FAIL(ObLogicalOperator::get_plan_item_info(plan_text, plan_item))) {
   } else {
     const ObIArray<ObColumnRefRawExpr*> &access = get_column_exprs();

@@ -224,6 +224,8 @@ jobs:
           probe "legacy 2nd positional: expect ERROR 1064" "select * from read_csv('/tmp/basic.csv', 'xml')"
           probe "unknown named param parses: expect ERROR 1235" "select * from read_csv('/tmp/basic.csv', sample_size = 10)"
           probe "EXPLAIN the varchar projection" "set session enable_file_sql=on; explain select name from read_csv('/tmp/basic.csv') f"
+          probe "EXPLAIN the int projection" "set session enable_file_sql=on; explain select id from read_csv('/tmp/basic.csv') f"
+          probe "EXPLAIN the constant projection" "set session enable_file_sql=on; explain select 1 from read_csv('/tmp/basic.csv') f"
           probe "count over the varchar column" "set session enable_file_sql=on; select count(name) from read_csv('/tmp/basic.csv') f"
           probe "varchar projection with limit 0" "set session enable_file_sql=on; select name from read_csv('/tmp/basic.csv') f limit 0"
           probe "constant projection from the file table" "set session enable_file_sql=on; select 1 from read_csv('/tmp/basic.csv') f"
@@ -251,7 +253,7 @@ jobs:
           ls -la /tmp/seekdb_home/log
           for f in /tmp/seekdb_home/log/*; do
             echo "===== $f ($(wc -l < "$f") lines)"
-            grep -nE "WARN|ERROR|VALUES TABLE|values table" "$f" | tail -60 || true
+            grep -nE "FILESQL-STEP|WARN|ERROR" "$f" | tail -100 || true
             echo "----- tail -----"
             tail -20 "$f" || true
           done

@@ -1689,8 +1689,14 @@ int ObStaticEngineCG::generate_spec(ObLogValuesTableAccess &op,
   int ret = OB_SUCCESS;
   UNUSED(in_root_job);
   const ObValuesTableDef *table_def = NULL;
+  LOG_INFO("FILESQL-STEP-4 generate the values table access spec",
+           "column_cnt", op.get_column_exprs().count(),
+           "output_cnt", op.get_output_exprs().count(),
+           "value_cnt", NULL == op.get_values_table_def() ? -1 :
+                        op.get_values_table_def()->access_exprs_.count());
   if (OB_ISNULL(table_def = op.get_values_table_def()) ||
       OB_UNLIKELY(op.get_output_exprs().empty())) {
+    LOG_WARN("FILESQL-STEP-4 invalid values table access node", K(ret));
     ret = OB_ERR_UNEXPECTED;
   } else {
     spec.access_type_ = table_def->access_type_;

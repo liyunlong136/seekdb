@@ -11855,8 +11855,13 @@ int ObLogPlan::do_alloc_values_table_path(ValuesTablePath *values_table_path,
     values_op->set_values_table_def(table_def);
     values_op->set_values_path(values_table_path);
     ObSEArray<ObColumnRefRawExpr *, 4> column_exprs;
+    LOG_INFO("FILESQL-STEP-2 build the values table access node",
+             "table_id", values_table_path->table_id_,
+             "column_cnt", table_def->column_cnt_, "row_cnt", table_def->row_cnt_);
     if (OB_FAIL(get_stmt()->get_column_exprs(values_table_path->table_id_, column_exprs))) {
     } else if (OB_UNLIKELY(column_exprs.count() != table_def->column_cnt_)) {
+      LOG_WARN("FILESQL-STEP-2 column count mismatch", K(column_exprs.count()),
+               K(table_def->column_cnt_));
       ret = OB_ERR_UNEXPECTED;
     } else if (OB_FAIL(values_op->get_column_exprs().assign(column_exprs))) {
     } else if (OB_FAIL(append(values_op->get_filter_exprs(), values_table_path->filter_))) {
