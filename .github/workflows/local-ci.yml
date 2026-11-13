@@ -103,7 +103,21 @@ jobs:
           cmake -S . -B "$BUILD_DIR" \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache \
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
-          make -C "$BUILD_DIR" -j"$(nproc)" seekdb
+          echo "----- type_name.c right after configure -----"
+          wc -l src/sql/parser/type_name.c || echo "type_name.c missing"
+          grep -c "get_type_name" src/sql/parser/type_name.c || echo "no get_type_name in source"
+          make -C "$BUILD_DIR" -j"$(nproc)" seekdb || {
+            echo "----- parser diagnostics after the failure -----"
+            wc -l src/sql/parser/type_name.c || true
+            head -6 src/sql/parser/type_name.c || true
+            find "$BUILD_DIR" -name "type_name.c.o" | while read -r obj; do
+              echo "== $obj"
+              nm "$obj" | grep -i type_name | head -5 || true
+            done
+            echo "== archive entries"
+            ar t "$BUILD_DIR/src/sql/libob_sql_static.a" 2>/dev/null | grep -i type_name | head -5 || true
+            exit 1
+          }
           test -x "$SEEKDB_BIN"
           ls -la "$BUILD_DIR/src/observer/"
 
