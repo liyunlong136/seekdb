@@ -4522,7 +4522,8 @@ int ObDMLResolver::resolve_read_csv_item(const ParseNode &parse_tree, TableItem 
       item->alias_name_ = alias_name;
     }
     if (OB_SUCC(ret)) {
-      table_def->access_type_ = ObValuesTableDef::ACCESS_OBJ;
+      table_def->access_type_ = ObValuesTableDef::ACCESS_EXPR;
+      table_def->is_const_ = true;
       table_def->row_cnt_ = row_cnt;
       table_def->column_cnt_ = column_cnt;
       for (int64_t i = 0; OB_SUCC(ret) && i < column_cnt; ++i) {
@@ -4607,8 +4608,19 @@ int ObDMLResolver::resolve_read_csv_item(const ParseNode &parse_tree, TableItem 
         } else {
           value.set_varchar(cell.data_, static_cast<ObString::obstr_size_t>(cell.len_));
         }
-        ObObjParam param(value);
-        if (OB_FAIL(table_def->access_objs_.push_back(param))) {
+        // the rows are handed over as constant expressions, exactly like the
+        // rows of a values table that comes from the parser
+        ObConstRawExpr *const_expr = NULL;
+        if (OB_FAIL(ObRawExprUtils::build_const_obj_expr(*params_.expr_factory_, value, const_expr))) {
+          LOG_USER_ERROR(OB_INVALID_ARGUMENT, "read_csv(), cannot build a value expression");
+          LOG_WARN("failed to build the const expr", K(ret));
+        } else if (OB_ISNULL(const_expr)) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("the const expr is null", K(ret));
+        } else if (OB_FAIL(const_expr->formalize(session_info_))) {
+          LOG_USER_ERROR(OB_INVALID_ARGUMENT, "read_csv(), cannot formalize a value");
+          LOG_WARN("failed to formalize the const expr", K(ret));
+        } else if (OB_FAIL(table_def->access_exprs_.push_back(const_expr))) {
           LOG_USER_ERROR(OB_INVALID_ARGUMENT, "read_csv(), cannot add a value");
           LOG_WARN("failed to add the csv value", K(ret));
         }
