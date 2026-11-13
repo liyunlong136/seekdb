@@ -33,12 +33,6 @@ class ObDelUpdStmt;
 class ObSelectResolver;
 class ObInsertResolver;
 
-namespace csv_scan
-{
-// the options of the read_csv() table function, defined in ob_dml_resolver.cpp
-struct CsvOptions;
-}
-
 static char *str_to_lower(char *pszBuf, int64_t length);
 /*
  * ResolverJoinInfo is used to store temporary join information that would only be used in resolver.
@@ -211,16 +205,15 @@ public:
   int resolve_joined_table_item(const ParseNode &parse_node, JoinedTable *&joined_table);
   int resolve_function_table_item(const ParseNode &table_node,
                                   TableItem *&table_item);
+  int resolve_file_scan_table_item(const ParseNode &table_node,
+                                   TableItem *&table_item);
+  int resolve_file_sql_constant(const ParseNode &node, common::ObObj &value);
   int resolve_json_table_item(const ParseNode &table_node,
                               TableItem *&table_item);
   int resolve_unnest_item(const ParseNode &table_node, TableItem *&table_item);
   int create_unnest_table_item(TableItem *&table_item, ObString table_name);
   int unnest_table_add_column(TableItem *&table_item, ColumnItem *&col_item, ObString col_name);
   int resolve_hybrid_search_item(const ParseNode &parse_tree, TableItem *&table_item);
-  int resolve_read_csv_item(const ParseNode &parse_tree, TableItem *&table_item);
-  int resolve_read_csv_options(const ParseNode *param_node, csv_scan::CsvOptions &options);
-  int resolve_read_csv_path(const ParseNode &path_node, ObString &path);
-  int resolve_read_csv_option(const ObString &name, const ParseNode &value_node, csv_scan::CsvOptions &options);
 
   int fill_same_column_to_using(JoinedTable* &joined_table);
   int get_columns_from_table_item(const TableItem *table_item, common::ObIArray<common::ObString> &column_names);

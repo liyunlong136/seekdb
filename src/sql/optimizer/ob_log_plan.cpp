@@ -2235,7 +2235,8 @@ int ObLogPlan::allocate_function_table_path(FunctionTablePath *func_table_path,
       OB_ISNULL(table_item = get_stmt()->get_table_item_by_id(func_table_path->table_id_))) {
     ret = OB_ERR_UNEXPECTED;
   } else if (OB_ISNULL(op = static_cast<ObLogFunctionTable*>(get_log_op_factory().
-                                        allocate(*this, LOG_FUNCTION_TABLE)))) {
+                                        allocate(*this, table_item->is_file_scan_table_
+                                            ? LOG_FILE_SCAN : LOG_FUNCTION_TABLE)))) {
     ret = OB_ALLOCATE_MEMORY_FAILED;
   } else {
     op->set_table_id(func_table_path->table_id_);
@@ -9247,11 +9248,9 @@ int ObLogPlan::generate_plan()
   if (OB_ISNULL(stmt = get_stmt())) {
     ret = OB_ERR_UNEXPECTED;
   } else if (OB_FAIL(generate_raw_plan())) {
-    LOG_WARN("FILESQL-STEP-C1 generate_raw_plan failed", K(ret));
   } else if (stmt->is_explain_stmt()) {
-    LOG_WARN("FILESQL-STEP-C1b the statement is an explain statement");
+    /*do nothing*/
   } else if (OB_FAIL(do_post_plan_processing())) {
-    LOG_WARN("FILESQL-STEP-C2 post plan processing failed", K(ret));
   } else if (OB_FAIL(plan_traverse_loop(PX_RESCAN,
                                         RUNTIME_FILTER,
                                         ALLOC_GI,
@@ -9267,12 +9266,8 @@ int ObLogPlan::generate_plan()
                                         ALLOC_STARTUP_EXPR,
                                         COLLECT_BATCH_EXEC_PARAM,
                                         ADJUST_SCAN_DIRECTION))) {
-    LOG_WARN("FILESQL-STEP-C3 the plan traverse loop failed", K(ret));
   } else if (OB_FAIL(do_post_traverse_processing())) {
-    LOG_WARN("FILESQL-STEP-C4 post traverse processing failed", K(ret));
-  } else {
-    LOG_WARN("FILESQL-STEP-C5 the logical plan is ready");
-  }
+  } else { /*do nothing*/ }
   return ret;
 }
 
@@ -11861,13 +11856,8 @@ int ObLogPlan::do_alloc_values_table_path(ValuesTablePath *values_table_path,
     values_op->set_values_table_def(table_def);
     values_op->set_values_path(values_table_path);
     ObSEArray<ObColumnRefRawExpr *, 4> column_exprs;
-    LOG_WARN("FILESQL-STEP-2 build the values table access node",
-             "table_id", values_table_path->table_id_,
-             "column_cnt", table_def->column_cnt_, "row_cnt", table_def->row_cnt_);
     if (OB_FAIL(get_stmt()->get_column_exprs(values_table_path->table_id_, column_exprs))) {
     } else if (OB_UNLIKELY(column_exprs.count() != table_def->column_cnt_)) {
-      LOG_WARN("FILESQL-STEP-2 column count mismatch", K(column_exprs.count()),
-               K(table_def->column_cnt_));
       ret = OB_ERR_UNEXPECTED;
     } else if (OB_FAIL(values_op->get_column_exprs().assign(column_exprs))) {
     } else if (OB_FAIL(append(values_op->get_filter_exprs(), values_table_path->filter_))) {

@@ -164,6 +164,7 @@ protected:
 
   //resolve select into
   int resolve_into_clause(const ParseNode *node);
+  int resolve_file_sql_copy(const ParseNode &node, ObSelectIntoItem &into_item);
   int resolve_into_const_node(const ParseNode *node, ObObj &obj);
   int resolve_into_field_node(const ParseNode *node, ObSelectIntoItem &into_item);
   int resolve_into_line_node(const ParseNode *node, ObSelectIntoItem &into_item);
@@ -348,21 +349,6 @@ protected:
 private:
   // disallow copy
   DISALLOW_COPY_AND_ASSIGN(ObSelectResolver);
-};
-
-// DESCRIBE <select> prints the schema that the file table function inferred,
-// in the same six columns that mysql uses for DESCRIBE <table>.
-class ObFileDescribeResolver : public ObSelectResolver
-{
-public:
-  explicit ObFileDescribeResolver(ObResolverParams &params)
-    : ObSelectResolver(params) {}
-  virtual ~ObFileDescribeResolver() {}
-  virtual int resolve(const ParseNode &parse_tree);
-private:
-  int build_describe_rows(ObSelectStmt &file_stmt, ObSelectStmt &describe_stmt);
-private:
-  DISALLOW_COPY_AND_ASSIGN(ObFileDescribeResolver);
 };
 
 
