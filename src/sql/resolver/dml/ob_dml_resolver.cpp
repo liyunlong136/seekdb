@@ -6264,6 +6264,32 @@ int ObDMLResolver::resolve_read_csv_item(const ParseNode &parse_tree, TableItem 
     }
   }
   if (OB_SUCC(ret)) {
+    // the parser based values table casts every value to its column type.  a
+    // value that is not cast keeps the accuracy of the literal, which is empty
+    // for a string, and the code generator cannot build a string constant
+    // without an accuracy.  the file values go through the same path
+    int64_t casted = 0;
+    for (int64_t i = 0; OB_SUCC(ret) && i < table_def->access_exprs_.count(); ++i) {
+      ObRawExpr *expr = table_def->access_exprs_.at(i);
+      ObRawExpr *new_expr = NULL;
+      const ObRawExprResType &dst = table_def->column_types_.at(i % column_cnt);
+      if (OB_ISNULL(expr)) {
+        ret = OB_ERR_UNEXPECTED;
+      } else if (OB_FAIL(ObRawExprUtils::try_add_cast_expr_above(*params_.expr_factory_,
+                                                                 session_info_, *expr, dst,
+                                                                 new_expr))) {
+        LOG_WARN("failed to cast the file value", K(ret));
+      } else if (OB_ISNULL(new_expr)) {
+        ret = OB_ERR_UNEXPECTED;
+      } else if (new_expr != expr) {
+        ++casted;
+        table_def->access_exprs_.at(i) = new_expr;
+      }
+    }
+    LOG_WARN("FILESQL-VALUE-CAST the file values are cast", K(ret), K(casted),
+             "total", table_def->access_exprs_.count());
+  }
+  if (OB_SUCC(ret)) {
     // the number of distinct values is only used by the optimizer
     for (int64_t i = 0; OB_SUCC(ret) && i < column_cnt; ++i) {
       if (OB_FAIL(table_def->column_ndvs_.push_back(row_cnt))) {
@@ -6311,7 +6337,16 @@ int ObDMLResolver::resolve_read_csv_item(const ParseNode &parse_tree, TableItem 
     table_item = item;
     LOG_WARN("FILESQL-STEP-1 the file table is resolved", K(ret),
              "column_cnt", column_cnt, "row_cnt", row_cnt,
-             "cells", cells.size());  } else {
+             "cells", cells.size(),
+             "value_cnt", table_def->access_exprs_.count(),
+             "value_type", table_def->access_exprs_.empty() ? -1 :
+                           static_cast<int64_t>(table_def->access_exprs_.at(0)->get_expr_type()),
+             "value_len", table_def->access_exprs_.empty() ? -1 :
+                          static_cast<int64_t>(table_def->access_exprs_.at(0)
+                              ->get_result_type().get_accuracy().get_length()),
+             "column_len", table_def->column_types_.empty() ? -1 :
+                           static_cast<int64_t>(table_def->column_types_.at(0)
+                               .get_accuracy().get_length()));  } else {
     LOG_WARN("FILESQL-STEP-1 the file table is not resolved", K(ret), K(path));
   }
   return ret;

@@ -4807,6 +4807,24 @@ int ObFileDescribeResolver::build_describe_rows(ObSelectStmt &file_stmt, ObSelec
       }
     }
   }
+  // a string value that keeps the accuracy of the literal makes the code
+  // generator fail, the parser based values table always casts its values
+  for (int64_t i = 0; OB_SUCC(ret) && i < def->access_exprs_.count(); ++i) {
+    ObRawExpr *expr = def->access_exprs_.at(i);
+    ObRawExpr *new_expr = NULL;
+    const ObRawExprResType &dst = def->column_types_.at(i % describe_column_cnt);
+    if (OB_ISNULL(expr)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (OB_FAIL(ObRawExprUtils::try_add_cast_expr_above(*params_.expr_factory_,
+                                                               session_info_, *expr, dst,
+                                                               new_expr))) {
+      LOG_WARN("failed to cast the describe value", K(ret));
+    } else if (OB_ISNULL(new_expr)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (new_expr != expr) {
+      def->access_exprs_.at(i) = new_expr;
+    }
+  }
   if (OB_SUCC(ret) && OB_FAIL(estimate_values_table_stats(*def))) {
     LOG_WARN("failed to estimate the describe table stats", K(ret));
   }
