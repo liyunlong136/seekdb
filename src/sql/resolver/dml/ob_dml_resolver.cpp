@@ -20,6 +20,7 @@
 #include "sql/resolver/dml/ob_view_table_resolver.h"
 #include "sql/optimizer/ob_optimizer_util.h"
 #include "sql/resolver/dml/ob_default_value_utils.h"
+#include "share/ob_errno.h"
 #include "share/schema/ob_part_mgr_util.h"
 #include "sql/pl/ob_pl_package.h"
 #include "sql/optimizer/ob_opt_est_utils.h"
@@ -6322,8 +6323,8 @@ int ObDMLResolver::resolve_read_csv_options(const ParseNode *param_node, csv_sca
         LOG_WARN("failed to resolve the file table options", K(ret));
       }
     } else {
-      ret = OB_ERR_PARSER_SYNTAX;
-      LOG_USER_ERROR(OB_ERR_PARSER_SYNTAX);
+      ret = OB_ERR_PARSE_SQL;
+      LOG_USER_ERROR(OB_ERR_PARSE_SQL, ob_errpkt_strerror(OB_ERR_PARSER_SYNTAX), 0, "", 1);
       LOG_WARN("unexpected file table option list", K(ret), KP(param_node));
     }
   } else {
@@ -6334,16 +6335,16 @@ int ObDMLResolver::resolve_read_csv_options(const ParseNode *param_node, csv_sca
     if (T_OP_EQ != param_node->type_ || 2 != param_node->num_child_
         || OB_ISNULL(name_node = param_node->children_[0])
         || OB_ISNULL(value_node = param_node->children_[1])) {
-      ret = OB_ERR_PARSER_SYNTAX;
-      LOG_USER_ERROR(OB_ERR_PARSER_SYNTAX);
+      ret = OB_ERR_PARSE_SQL;
+      LOG_USER_ERROR(OB_ERR_PARSE_SQL, ob_errpkt_strerror(OB_ERR_PARSER_SYNTAX), 0, "", 1);
       LOG_WARN("the file table option must be written as name = value", K(ret), KP(param_node));
     } else if (OB_NOT_NULL(name_node->str_value_)) {
       name.assign_ptr(name_node->str_value_, name_node->str_len_);
     }
     if (OB_FAIL(ret)) {
     } else if (name.empty()) {
-      ret = OB_ERR_PARSER_SYNTAX;
-      LOG_USER_ERROR(OB_ERR_PARSER_SYNTAX);
+      ret = OB_ERR_PARSE_SQL;
+      LOG_USER_ERROR(OB_ERR_PARSE_SQL, ob_errpkt_strerror(OB_ERR_PARSER_SYNTAX), 0, "", 1);
       LOG_WARN("the file table option has no name", K(ret));
     } else if (OB_FAIL(resolve_read_csv_option(name, *value_node, options))) {
       LOG_WARN("failed to resolve the file table option", K(ret), K(name));
