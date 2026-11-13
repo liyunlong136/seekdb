@@ -218,7 +218,7 @@ public:
   int unnest_table_add_column(TableItem *&table_item, ColumnItem *&col_item, ObString col_name);
   int resolve_hybrid_search_item(const ParseNode &parse_tree, TableItem *&table_item);
   int resolve_read_csv_item(const ParseNode &parse_tree, TableItem *&table_item);
-  int resolve_read_csv_options(const ParseNode &param_node, csv_scan::CsvOptions &options);
+  int resolve_read_csv_options(const ParseNode *param_node, csv_scan::CsvOptions &options);
   int resolve_read_csv_option(const ObString &name, const ParseNode &value_node, csv_scan::CsvOptions &options);
 
   int fill_same_column_to_using(JoinedTable* &joined_table);
