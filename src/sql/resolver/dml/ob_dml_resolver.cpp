@@ -6196,37 +6196,37 @@ int ObDMLResolver::resolve_read_csv_item(const ParseNode &parse_tree, TableItem 
       if (ObTinyIntType == res_type.get_type()) {
         bool bool_value = false;
         if (!cell.is_null_ && csv_scan::csv_try_bool(cell.data_, cell.len_, bool_value)) {
-          value.set_tinyint_value(static_cast<int8_t>(bool_value ? 1 : 0));
+          value.set_tinyint(static_cast<int8_t>(bool_value ? 1 : 0));
         } else {
-          value.set_tinyint_value(0);
+          value.set_tinyint(0);
         }
       } else if (ObIntType == res_type.get_type()) {
         int64_t int_value = 0;
         if (!cell.is_null_ && csv_scan::csv_try_int64(cell.data_, cell.len_, int_value)) {
-          value.set_int_value(int_value);
+          value.set_int(int_value);
         } else {
-          value.set_int_value(0);
+          value.set_int(0);
         }
       } else if (ObDoubleType == res_type.get_type()) {
         double double_value = 0;
         if (!cell.is_null_ && csv_scan::csv_try_double(cell.data_, cell.len_, double_value)) {
-          value.set_double_value(double_value);
+          value.set_double(double_value);
         } else {
-          value.set_double_value(0);
+          value.set_double(0);
         }
       } else if (ObDateType == res_type.get_type()) {
         int32_t date_value = 0;
         if (!cell.is_null_ && csv_scan::csv_try_date(cell.data_, cell.len_, date_value)) {
-          value.set_date_value(date_value);
+          value.set_date(date_value);
         } else {
-          value.set_date_value(0);
+          value.set_date(0);
         }
       } else if (ObDateTimeType == res_type.get_type()) {
         int64_t datetime_value = 0;
         if (!cell.is_null_ && csv_scan::csv_try_datetime(cell.data_, cell.len_, datetime_value)) {
-          value.set_datetime_value(datetime_value);
+          value.set_datetime(datetime_value);
         } else {
-          value.set_datetime_value(0);
+          value.set_datetime(0);
         }
       } else {
         value.set_varchar(cell.data_, static_cast<ObString::obstr_size_t>(cell.len_));
