@@ -43,6 +43,9 @@
 #include "sql/resolver/ddl/ob_drop_database_resolver.h"
 #include "sql/resolver/ddl/ob_create_view_resolver.h"
 #include "sql/resolver/ddl/ob_explain_resolver.h"
+#include "sql/resolver/dml/ob_select_resolver.h"
+#include "sql/resolver/dml/ob_select_stmt.h"
+#include "sql/engine/cmd/ob_load_data_parser.h"
 #include "sql/resolver/ddl/ob_create_outline_resolver.h"
 #include "sql/resolver/ddl/ob_alter_outline_resolver.h"
 #include "sql/resolver/ddl/ob_drop_outline_resolver.h"
@@ -473,7 +476,19 @@ int ObResolver::resolve(IsPrepared if_prepared, const ParseNode &parse_tree, ObS
         break;
       }
       case T_EXPLAIN: {
-        REGISTER_STMT_RESOLVER(Explain);
+        if (1 == real_parse_tree->value_
+            && NULL != real_parse_tree->children_[4]
+            && T_SELECT == real_parse_tree->children_[4]->type_) {
+          // DESCRIBE <select> prints the schema the file table function inferred
+          ret = stmt_resolver_func<ObFileDescribeResolver>(
+                  params_, *real_parse_tree->children_[4], stmt);
+        } else {
+          REGISTER_STMT_RESOLVER(Explain);
+        }
+        break;
+      }
+      case T_COPY_STMT: {
+        ret = resolve_copy_stmt(*real_parse_tree, stmt);
         break;
       }
       case T_ALTER_SYSTEM_SET: {
@@ -679,6 +694,93 @@ int ObResolver::resolve(IsPrepared if_prepared, const ParseNode &parse_tree, ObS
       }
     }
   }  // end if
+  return ret;
+}
+
+int ObResolver::resolve_copy_stmt(const ParseNode &parse_tree, ObStmt *&stmt)
+{
+  int ret = OB_SUCCESS;
+  ObStmt *child_stmt = NULL;
+  ObSelectStmt *select_stmt = NULL;
+  ObSelectIntoItem *into_item = NULL;
+  ObExternalFileFormat format;
+  ObString path;
+  const ParseNode *select_node = NULL;
+  const ParseNode *path_node = NULL;
+  stmt = NULL;
+  if (OB_ISNULL(params_.allocator_) || OB_ISNULL(params_.session_info_)
+      || OB_ISNULL(params_.expr_factory_) || OB_ISNULL(params_.query_ctx_)) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("the resolver parameters are not ready", K(ret));
+  } else if (3 != parse_tree.num_child_
+             || OB_ISNULL(select_node = parse_tree.children_[0])
+             || OB_ISNULL(path_node = parse_tree.children_[1])) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected copy statement", K(ret), K(parse_tree.num_child_));
+  } else if (T_VARCHAR != path_node->type_ || OB_ISNULL(path_node->str_value_)
+             || 0 == path_node->str_len_) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_USER_ERROR(OB_INVALID_ARGUMENT, "copy, the target path must be a string constant");
+  } else if (OB_FAIL(resolve(IS_NOT_PREPARED_STMT, *select_node, child_stmt))) {
+    LOG_WARN("failed to resolve the copy source", K(ret));
+  } else if (OB_ISNULL(child_stmt) || !child_stmt->is_select_stmt()) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "copy, the source must be a select statement");
+  } else if (OB_ISNULL(into_item = static_cast<ObSelectIntoItem *>(
+                           params_.allocator_->alloc(sizeof(ObSelectIntoItem))))) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+    LOG_WARN("failed to allocate the select into item", K(ret));
+  } else {
+    select_stmt = static_cast<ObSelectStmt *>(child_stmt);
+    new (into_item) ObSelectIntoItem();
+    path.assign_ptr(path_node->str_value_, static_cast<int32_t>(path_node->str_len_));
+    into_item->into_type_ = T_INTO_OUTFILE;
+    into_item->outfile_name_.set_varchar(path);
+    into_item->outfile_name_.set_collation_type(ObCharset::get_system_collation());
+    into_item->is_single_ = true;
+    into_item->is_optional_ = false;
+    into_item->cs_type_ = ObCharset::get_system_collation();
+    into_item->max_file_size_ = ObSelectIntoItem::DEFAULT_MAX_FILE_SIZE;
+    into_item->buffer_size_ = ObSelectIntoItem::DEFAULT_BUFFER_SIZE;
+    format.format_type_ = ObExternalFileFormat::CSV_FORMAT;
+    format.options_ = 0;
+    if (OB_FAIL(format.csv_format_.init_format(ObDataInFileStruct(), 0, into_item->cs_type_))) {
+      LOG_WARN("failed to init the csv format", K(ret));
+    } else {
+      // copy always writes the header line, exactly like duckdb does
+      format.csv_format_.parse_header_ = true;
+      format.csv_format_.skip_header_lines_ = 1;
+      // init_format fills in the load data defaults, a plain csv file is
+      // comma separated while the load data default is a tab
+      format.csv_format_.field_term_str_ = ObString::make_string(",");
+      format.csv_format_.line_term_str_ = ObString::make_string("\n");
+      if (OB_FAIL(format.to_string_with_alloc(into_item->external_properties_,
+                                              *params_.allocator_, true))) {
+        LOG_WARN("failed to serialize the csv format", K(ret));
+      }
+    }
+    // the header line is written from the output column names, they travel
+    // to the writer the same way the 'into @var' names do
+    for (int64_t i = 0; OB_SUCC(ret) && i < select_stmt->get_select_item_size(); ++i) {
+      ObString name = select_stmt->get_select_item(i).alias_name_;
+      ObString stored;
+      if (name.empty()) {
+        name = select_stmt->get_select_item(i).expr_name_;
+      }
+      if (name.empty()) {
+        name = ObString::make_string("column");
+      }
+      if (OB_FAIL(ob_write_string(*params_.allocator_, name, stored))) {
+        LOG_WARN("failed to copy the output column name", K(ret));
+      } else if (OB_FAIL(into_item->user_vars_.push_back(stored))) {
+        LOG_WARN("failed to add the output column name", K(ret));
+      }
+    }
+    if (OB_SUCC(ret)) {
+      select_stmt->set_select_into(into_item);
+      stmt = select_stmt;
+    }
+  }
   return ret;
 }
 

@@ -42,6 +42,11 @@ public:
   ObResolverParams &get_params() { return params_; }
 
 private:
+  // COPY (select ...) TO 'path' (format csv, ...) reuses the SELECT INTO
+  // OUTFILE plan, the item is built here instead of from the parse tree.
+  int resolve_copy_stmt(const ParseNode &parse_tree, ObStmt *&stmt);
+
+private:
   template <typename ResolverType>
   int stmt_resolver_func(ObResolverParams &params, const ParseNode &parse_tree, ObStmt *&stmt);
 
