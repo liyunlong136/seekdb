@@ -4493,6 +4493,10 @@ int ObDMLResolver::resolve_read_csv_item(const ParseNode &parse_tree, TableItem 
   } else if (OB_FAIL(csv_scan::csv_read_file(path, options, *allocator_, columns, cells,
                                             row_cnt, column_cnt))) {
     LOG_WARN("failed to read the csv file", K(ret), K(path));
+  } else if (column_cnt <= 0) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_USER_ERROR(OB_INVALID_ARGUMENT, "read_csv(), the file has no column");
+    LOG_WARN("the csv file has no column", K(path), K(row_cnt), K(column_cnt));
   } else if (OB_ISNULL(item = stmt->create_table_item(*allocator_))) {
     ret = OB_ALLOCATE_MEMORY_FAILED;
     LOG_WARN("failed to create the table item", K(ret));
@@ -4511,6 +4515,7 @@ int ObDMLResolver::resolve_read_csv_item(const ParseNode &parse_tree, TableItem 
       item->table_name_ = alias_name;
       item->alias_name_ = alias_name;
     } else if (OB_FAIL(stmt->generate_values_table_name(*allocator_, alias_name))) {
+      LOG_USER_ERROR(OB_INVALID_ARGUMENT, "read_csv(), cannot generate the table name");
       LOG_WARN("failed to generate the values table name", K(ret));
     } else {
       item->table_name_ = alias_name;
@@ -4552,6 +4557,7 @@ int ObDMLResolver::resolve_read_csv_item(const ParseNode &parse_tree, TableItem 
           }
         }
         if (OB_FAIL(table_def->column_types_.push_back(res_type))) {
+          LOG_USER_ERROR(OB_INVALID_ARGUMENT, "read_csv(), cannot add the column type");
           LOG_WARN("failed to add the column type", K(ret));
         }
       }
@@ -4603,6 +4609,7 @@ int ObDMLResolver::resolve_read_csv_item(const ParseNode &parse_tree, TableItem 
         }
         ObObjParam param(value);
         if (OB_FAIL(table_def->access_objs_.push_back(param))) {
+          LOG_USER_ERROR(OB_INVALID_ARGUMENT, "read_csv(), cannot add a value");
           LOG_WARN("failed to add the csv value", K(ret));
         }
       }
@@ -4630,6 +4637,7 @@ int ObDMLResolver::resolve_read_csv_item(const ParseNode &parse_tree, TableItem 
           column_expr->set_ref_id(item->table_id_, i + OB_APP_MIN_COLUMN_ID);
           column_expr->set_column_attr(item->table_name_, columns.at(i).name_);
           if (OB_FAIL(column_expr->add_flag(IS_COLUMN))) {
+            LOG_USER_ERROR(OB_INVALID_ARGUMENT, "read_csv(), cannot mark the column");
             LOG_WARN("failed to mark the column expression", K(ret));
           } else {
             ColumnItem column_item;
@@ -4638,6 +4646,7 @@ int ObDMLResolver::resolve_read_csv_item(const ParseNode &parse_tree, TableItem 
             column_item.column_id_ = column_expr->get_column_id();
             column_item.column_name_ = column_expr->get_column_name();
             if (OB_FAIL(stmt->add_column_item(column_item))) {
+              LOG_USER_ERROR(OB_INVALID_ARGUMENT, "read_csv(), cannot add the column item");
               LOG_WARN("failed to add the column item", K(ret));
             }
           }
@@ -4645,6 +4654,7 @@ int ObDMLResolver::resolve_read_csv_item(const ParseNode &parse_tree, TableItem 
       }
     }
     if (OB_SUCC(ret) && OB_FAIL(stmt->add_table_item(session_info_, item))) {
+      LOG_USER_ERROR(OB_INVALID_ARGUMENT, "read_csv(), cannot add the table item");
       LOG_WARN("failed to add the table item", K(ret));
     }
     table_item = item;
