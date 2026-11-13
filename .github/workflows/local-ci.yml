@@ -223,6 +223,12 @@ jobs:
           probe "null and date: expect NULL for the empty day" "set session enable_file_sql=on; select id, day from read_csv('/tmp/basic2.csv') f order by id"
           probe "legacy 2nd positional: expect ERROR 1064" "select * from read_csv('/tmp/basic.csv', 'xml')"
           probe "unknown named param parses: expect ERROR 1235" "select * from read_csv('/tmp/basic.csv', sample_size = 10)"
+          probe "EXPLAIN the varchar projection" "set session enable_file_sql=on; explain select name from read_csv('/tmp/basic.csv') f"
+          probe "count over the varchar column" "set session enable_file_sql=on; select count(name) from read_csv('/tmp/basic.csv') f"
+          probe "varchar projection with limit 0" "set session enable_file_sql=on; select name from read_csv('/tmp/basic.csv') f limit 0"
+          probe "constant projection from the file table" "set session enable_file_sql=on; select 1 from read_csv('/tmp/basic.csv') f"
+          probe "varchar predicate only" "set session enable_file_sql=on; select id from read_csv('/tmp/basic.csv') f where name = 'alpha'"
+          probe "insert select from the file table" "set session enable_file_sql=on; create table if not exists diag_t(id bigint, name varchar(32), score double); insert into diag_t select * from read_csv('/tmp/basic.csv') f; select * from diag_t"
 
       - name: Run mysqltest suite
         shell: bash
@@ -242,9 +248,13 @@ jobs:
         shell: bash
         run: |
           sleep 5
-          echo "----- WARN / ERROR lines from the observer log -----"
-          grep -h -E "\[.*\]\[?(WARN|ERROR)\]?" /tmp/seekdb_home/log/seekdb.log | tail -80 || true
-          ls -la /tmp/seekdb_home/log || true
+          ls -la /tmp/seekdb_home/log
+          for f in /tmp/seekdb_home/log/*; do
+            echo "===== $f ($(wc -l < "$f") lines)"
+            grep -nE "WARN|ERROR|VALUES TABLE|values table" "$f" | tail -60 || true
+            echo "----- tail -----"
+            tail -20 "$f" || true
+          done
 
       - name: Upload logs
         if: always()

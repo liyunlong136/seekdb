@@ -77,6 +77,9 @@ int ObValuesTableAccessOp::inner_open()
       }
     }
   }
+  LOG_INFO("values table access opened", K(ret), K(MY_SPEC.access_type_),
+           "column_cnt", MY_SPEC.column_exprs_.count(),
+           "value_cnt", MY_SPEC.value_exprs_.count(), K(row_cnt_));
   return ret;
 }
 
@@ -197,6 +200,10 @@ int ObValuesTableAccessOp::calc_datum_from_expr(const int64_t col_idx,
       dst_expr->set_evaluated_projected(eval_ctx_);
     }
   } else {
+    LOG_WARN("values table column is converted", K(col_idx), K(row_idx),
+             "src_type", src_meta.type_, "src_cs", src_meta.cs_type_,
+             "dst_type", dst_expr->datum_meta_.type_,
+             "dst_cs", dst_expr->datum_meta_.cs_type_);
     if (OB_FAIL(ObCharset::check_valid_implicit_convert(src_meta.cs_type_,
                                                         dst_expr->datum_meta_.cs_type_))) {
     } else {
