@@ -704,6 +704,12 @@ int ObResolver::resolve(IsPrepared if_prepared, const ParseNode &parse_tree, ObS
       }
     }
   }  // end if
+  if (OB_SUCC(ret)) {
+    LOG_WARN("FILESQL-STEP-A the statement is resolved", K(ret),
+             "stmt_type", OB_ISNULL(stmt) ? -1 : static_cast<int64_t>(stmt->get_stmt_type()));
+  } else {
+    LOG_WARN("FILESQL-STEP-A the statement is not resolved", K(ret));
+  }
   return ret;
 }
 

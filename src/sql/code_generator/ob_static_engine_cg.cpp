@@ -1689,7 +1689,7 @@ int ObStaticEngineCG::generate_spec(ObLogValuesTableAccess &op,
   int ret = OB_SUCCESS;
   UNUSED(in_root_job);
   const ObValuesTableDef *table_def = NULL;
-  LOG_INFO("FILESQL-STEP-4 generate the values table access spec",
+  LOG_WARN("FILESQL-STEP-4 generate the values table access spec",
            "column_cnt", op.get_column_exprs().count(),
            "output_cnt", op.get_output_exprs().count(),
            "value_cnt", NULL == op.get_values_table_def() ? -1 :

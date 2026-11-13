@@ -140,6 +140,9 @@ int ObOptimizer::optimize(ObDMLStmt &stmt, ObLogPlan *&logical_plan)
     logical_plan = plan;
     LOG_TRACE("succ to optimize statement", "stmt", query_ctx->get_sql_stmt(),
                 K(logical_plan->get_optimization_cost()));
+    LOG_WARN("FILESQL-STEP-B the logical plan is generated", K(ret));
+  } else {
+    LOG_WARN("FILESQL-STEP-B the logical plan is not generated", K(ret));
   }
   optimizer_mem_usage = ctx_.get_allocator().total() - last_mem_usage;
   return ret;

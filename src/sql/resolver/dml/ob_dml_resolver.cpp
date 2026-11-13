@@ -6309,7 +6309,7 @@ int ObDMLResolver::resolve_read_csv_item(const ParseNode &parse_tree, TableItem 
   }
   if (OB_SUCC(ret)) {
     table_item = item;
-    LOG_INFO("FILESQL-STEP-1 the file table is resolved", K(ret),
+    LOG_WARN("FILESQL-STEP-1 the file table is resolved", K(ret),
              "column_cnt", column_cnt, "row_cnt", row_cnt,
              "cells", cells.size());  } else {
     LOG_WARN("FILESQL-STEP-1 the file table is not resolved", K(ret), K(path));
@@ -6443,11 +6443,26 @@ int ObDMLResolver::resolve_read_csv_option(const ObString &name, const ParseNode
   ObString text;
   int64_t int_value = 0;
   if (0 == name.compare("header")) {
+    bool ok = false;
     if (T_BOOL == value_node.type_ || T_INT == value_node.type_) {
       options.has_header_ = (0 != value_node.value_);
-    } else {
+      ok = true;
+    } else if (OB_NOT_NULL(value_node.str_value_)) {
+      // the parser hands "true"/"false" over as a bare word in some builds
+      ObString text(value_node.str_len_, value_node.str_value_);
+      if (0 == text.compare("true") || 0 == text.compare("TRUE") || 0 == text.compare("1")) {
+        options.has_header_ = true;
+        ok = true;
+      } else if (0 == text.compare("false") || 0 == text.compare("FALSE")
+                 || 0 == text.compare("0")) {
+        options.has_header_ = false;
+        ok = true;
+      }
+    }
+    if (!ok) {
       ret = OB_NOT_SUPPORTED;
       LOG_USER_ERROR(OB_NOT_SUPPORTED, "the file table function, the header option must be a boolean");
+      LOG_WARN("the header option is not a boolean", K(ret), "node_type", value_node.type_);
     }
   } else if (0 == name.compare("sample_size")) {
     // the whole file is always scanned, sample_size = -1 means scan everything

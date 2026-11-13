@@ -9247,9 +9247,11 @@ int ObLogPlan::generate_plan()
   if (OB_ISNULL(stmt = get_stmt())) {
     ret = OB_ERR_UNEXPECTED;
   } else if (OB_FAIL(generate_raw_plan())) {
+    LOG_WARN("FILESQL-STEP-C1 generate_raw_plan failed", K(ret));
   } else if (stmt->is_explain_stmt()) {
-    /*do nothing*/
+    LOG_WARN("FILESQL-STEP-C1b the statement is an explain statement");
   } else if (OB_FAIL(do_post_plan_processing())) {
+    LOG_WARN("FILESQL-STEP-C2 post plan processing failed", K(ret));
   } else if (OB_FAIL(plan_traverse_loop(PX_RESCAN,
                                         RUNTIME_FILTER,
                                         ALLOC_GI,
@@ -9265,8 +9267,12 @@ int ObLogPlan::generate_plan()
                                         ALLOC_STARTUP_EXPR,
                                         COLLECT_BATCH_EXEC_PARAM,
                                         ADJUST_SCAN_DIRECTION))) {
+    LOG_WARN("FILESQL-STEP-C3 the plan traverse loop failed", K(ret));
   } else if (OB_FAIL(do_post_traverse_processing())) {
-  } else { /*do nothing*/ }
+    LOG_WARN("FILESQL-STEP-C4 post traverse processing failed", K(ret));
+  } else {
+    LOG_WARN("FILESQL-STEP-C5 the logical plan is ready");
+  }
   return ret;
 }
 
@@ -11855,7 +11861,7 @@ int ObLogPlan::do_alloc_values_table_path(ValuesTablePath *values_table_path,
     values_op->set_values_table_def(table_def);
     values_op->set_values_path(values_table_path);
     ObSEArray<ObColumnRefRawExpr *, 4> column_exprs;
-    LOG_INFO("FILESQL-STEP-2 build the values table access node",
+    LOG_WARN("FILESQL-STEP-2 build the values table access node",
              "table_id", values_table_path->table_id_,
              "column_cnt", table_def->column_cnt_, "row_cnt", table_def->row_cnt_);
     if (OB_FAIL(get_stmt()->get_column_exprs(values_table_path->table_id_, column_exprs))) {
