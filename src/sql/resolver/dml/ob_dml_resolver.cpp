@@ -6275,7 +6275,7 @@ int ObDMLResolver::resolve_read_csv_item(const ParseNode &parse_tree, TableItem 
       const ObRawExprResType &dst = table_def->column_types_.at(i % column_cnt);
       if (OB_ISNULL(expr)) {
         ret = OB_ERR_UNEXPECTED;
-      } else if (OB_FAIL(ObRawExprUtils::try_add_cast_expr_above(*params_.expr_factory_,
+      } else if (OB_FAIL(ObRawExprUtils::try_add_cast_expr_above(params_.expr_factory_,
                                                                  session_info_, *expr, dst,
                                                                  new_expr))) {
         LOG_WARN("failed to cast the file value", K(ret));
