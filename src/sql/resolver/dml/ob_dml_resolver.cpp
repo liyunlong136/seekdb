@@ -4485,9 +4485,11 @@ int ObDMLResolver::resolve_read_csv_item(const ParseNode &parse_tree, TableItem 
     LOG_WARN("unexpected read_csv expression", K(parse_tree.num_child_));
   } else if (OB_FAIL(resolve_read_csv_options(parse_tree.children_[1], options))) {
     LOG_WARN("failed to resolve the read_csv options", K(ret));
-  } else if (OB_FAIL(resolve_str_const(*parse_tree.children_[0], path))) {
+  } else if (OB_FAIL(resolve_read_csv_path(*parse_tree.children_[0], path))) {
+    LOG_WARN("failed to resolve the read_csv path", K(ret));
+  } else if (path.empty()) {
     ret = OB_INVALID_ARGUMENT;
-    LOG_USER_ERROR(OB_INVALID_ARGUMENT, "read_csv(), the file path must be a string constant");
+    LOG_USER_ERROR(OB_INVALID_ARGUMENT, "read_csv(), the file path is empty");
   } else if (OB_FAIL(csv_scan::csv_read_file(path, options, *allocator_, columns, cells,
                                             row_cnt, column_cnt))) {
     LOG_WARN("failed to read the csv file", K(ret), K(path));
@@ -4662,10 +4664,12 @@ int ObDMLResolver::resolve_read_csv_options(const ParseNode *param_node, csv_sca
   } else {
     for (int64_t i = 0; OB_SUCC(ret) && i < param_node->num_child_; ++i) {
       param = param_node->children_[i];
-      if (OB_ISNULL(param) || T_LINK_NODE != param->type_ || 2 != param->num_child_
+      // every option is a comparison expression of the form name = value
+      if (OB_ISNULL(param) || T_OP_EQ != param->type_ || 2 != param->num_child_
           || OB_ISNULL(param->children_[0]) || OB_ISNULL(param->children_[1])) {
-        ret = OB_ERR_UNEXPECTED;
-        LOG_WARN("unexpected read_csv option", K(param));
+        ret = OB_ERR_PARSER_SYNTAX;
+        LOG_USER_ERROR(OB_ERR_PARSER_SYNTAX);
+        LOG_WARN("the read_csv option must be written as name = value", K(ret), K(param));
         break;
       }
       const ParseNode *name_node = param->children_[0];
@@ -4674,11 +4678,65 @@ int ObDMLResolver::resolve_read_csv_options(const ParseNode *param_node, csv_sca
       if (OB_NOT_NULL(name_node->str_value_)) {
         name.assign_ptr(name_node->str_value_, name_node->str_len_);
       }
-      if (0 == name.length()) {
-        ret = OB_ERR_UNEXPECTED;
+      if (name.empty()) {
+        ret = OB_ERR_PARSER_SYNTAX;
+        LOG_USER_ERROR(OB_ERR_PARSER_SYNTAX);
         LOG_WARN("the read_csv option has no name", K(ret));
       } else if (OB_FAIL(resolve_read_csv_option(name, *value_node, options))) {
         LOG_WARN("failed to resolve the read_csv option", K(ret), K(name));
+      }
+    }
+  }
+  return ret;
+}
+
+int ObDMLResolver::resolve_read_csv_path(const ParseNode &parse_tree, ObString &path)
+{
+  int ret = OB_SUCCESS;
+  const ParseNode *node = &parse_tree;
+  ObString raw;
+  // unwrap a single element expression list
+  while (OB_SUCC(ret) && OB_NOT_NULL(node) && T_EXPR_LIST == node->type_ && 1 == node->num_child_) {
+    node = node->children_[0];
+  }
+  if (OB_ISNULL(node)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("the read_csv path node is null", K(ret));
+  } else if (T_VARCHAR == node->type_ || T_CHAR == node->type_ || T_NCHAR == node->type_) {
+    if (OB_ISNULL(node->str_value_)) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_USER_ERROR(OB_INVALID_ARGUMENT, "read_csv(), the file path must be a string constant");
+    } else {
+      raw.assign_ptr(node->str_value_, static_cast<int32_t>(node->str_len_));
+    }
+  } else if (T_QUESTIONMARK == node->type_) {
+    const int64_t param_idx = node->value_;
+    if (OB_ISNULL(params_.param_list_) || param_idx < 0
+        || param_idx >= params_.param_list_->count()) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_USER_ERROR(OB_INVALID_ARGUMENT, "read_csv(), the file path parameter is missing");
+    } else if (!params_.param_list_->at(param_idx).is_string_type()) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_USER_ERROR(OB_INVALID_ARGUMENT, "read_csv(), the file path must be a string");
+    } else {
+      raw = params_.param_list_->at(param_idx).get_string();
+    }
+  } else if (OB_FAIL(resolve_str_const(*node, raw))) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_USER_ERROR(OB_INVALID_ARGUMENT, "read_csv(), the file path must be a string constant");
+  }
+  if (OB_SUCC(ret)) {
+    if (raw.empty()) {
+      path.reset();
+    } else {
+      char *buf = static_cast<char *>(allocator_->alloc(raw.length() + 1));
+      if (OB_ISNULL(buf)) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+        LOG_WARN("failed to allocate the read_csv path", K(ret));
+      } else {
+        MEMCPY(buf, raw.ptr(), raw.length());
+        buf[raw.length()] = '\0';
+        path.assign_ptr(buf, raw.length());
       }
     }
   }

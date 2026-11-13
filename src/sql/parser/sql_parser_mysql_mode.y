@@ -17458,18 +17458,11 @@ read_csv_alias:
 ;
 
 read_csv_param_list:
-read_csv_param
+expr
 {
   malloc_non_terminal_node($$, result->malloc_pool_, T_LINK_NODE, 1, $1);
 }
-| read_csv_param_list ',' read_csv_param
-{
-  malloc_non_terminal_node($$, result->malloc_pool_, T_LINK_NODE, 2, $1, $3);
-}
-;
-
-read_csv_param:
-relation_name '=' expr
+| read_csv_param_list ',' expr
 {
   malloc_non_terminal_node($$, result->malloc_pool_, T_LINK_NODE, 2, $1, $3);
 }
