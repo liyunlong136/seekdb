@@ -6180,6 +6180,16 @@ int ObDMLResolver::resolve_read_csv_item(const ParseNode &parse_tree, TableItem 
           res_type.set_type(ObVarcharType);
           res_type.set_collation_type(
               ObCharset::get_default_collation(ObCharset::get_default_charset()));
+          // a string column needs an accuracy: the code generator derives the
+          // datum meta from it and a missing length makes the plan fail
+          int64_t max_len = 1;
+          for (int64_t i_cell = i; i_cell < cells.size(); i_cell += column_cnt) {
+            const csv_scan::CsvCell &cell = cells.at(i_cell);
+            if (!cell.is_null_ && cell.len_ > max_len) {
+              max_len = cell.len_;
+            }
+          }
+          res_type.set_length(static_cast<common::ObLength>(max_len));
           break;
         }
       }
