@@ -6322,7 +6322,7 @@ int ObDMLResolver::resolve_read_csv_options(const ParseNode *param_node, csv_sca
     } else {
       ret = OB_ERR_PARSER_SYNTAX;
       LOG_USER_ERROR(OB_ERR_PARSER_SYNTAX);
-      LOG_WARN("unexpected file table option list", K(ret), KPC(param_node));
+      LOG_WARN("unexpected file table option list", K(ret), KP(param_node));
     }
   } else {
     // every single option is a comparison expression name = value
@@ -6334,7 +6334,7 @@ int ObDMLResolver::resolve_read_csv_options(const ParseNode *param_node, csv_sca
         || OB_ISNULL(value_node = param_node->children_[1])) {
       ret = OB_ERR_PARSER_SYNTAX;
       LOG_USER_ERROR(OB_ERR_PARSER_SYNTAX);
-      LOG_WARN("the file table option must be written as name = value", K(ret), KPC(param_node));
+      LOG_WARN("the file table option must be written as name = value", K(ret), KP(param_node));
     } else if (OB_NOT_NULL(name_node->str_value_)) {
       name.assign_ptr(name_node->str_value_, name_node->str_len_);
     }
