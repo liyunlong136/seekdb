@@ -134,6 +134,23 @@ select tokenize('hello world abcdefghijklmnopqrstuvwxyz', 'space', '[{"output": 
 select tokenize('hello world abcdefghijklmnopqrstuvwxyz', 'ik', '[{"output": "all"}, {"additional_args": [{"ngram_token_size": 6}, {"max_token_size": 10}]}]');
 
 
+# Stopword checks must retain the dictionary collation on the UTF-8 fast path
+# and retain conversion for other character sets. Check frequency and doc_len.
+select json_contains(tokenize(_utf8mb4 'THE the database DATABASE' COLLATE utf8mb4_bin, 'space', '[{"output": "all"}]'), '{"tokens": [{"database": 2}], "doc_len": 2}') as ok;
+select json_contains(tokenize(_utf8mb4 'THE the database DATABASE' COLLATE utf8mb4_general_ci, 'space', '[{"output": "all"}]'), '{"tokens": [{"database": 2}], "doc_len": 2}') as ok;
+select json_contains(tokenize(CONVERT(_utf8mb4 'THE the database DATABASE' USING latin1) COLLATE latin1_bin, 'space', '[{"output": "all"}]'), '{"tokens": [{"database": 2}], "doc_len": 2}') as ok;
+select json_contains(tokenize(CONVERT(_utf8mb4 'THE the database DATABASE' USING gbk) COLLATE gbk_bin, 'space', '[{"output": "all"}]'), '{"tokens": [{"database": 2}], "doc_len": 2}') as ok;
+select json_contains(tokenize(_utf8mb4 'the café café' COLLATE utf8mb4_bin, 'space', '[{"output": "all"}]'), '{"tokens": [{"café": 2}], "doc_len": 2}') as ok;
+select json_contains(tokenize(CONVERT(_utf8mb4 'the café café' USING latin1) COLLATE latin1_bin, 'space', '[{"output": "all"}]'), '{"tokens": [{"café": 2}], "doc_len": 2}') as ok;
+
+# Exercise index writes and MATCH with the same stopword lookup path.
+create table stopword_fast_path (id int primary key, body varchar(200) character set utf8mb4 collate utf8mb4_bin, fulltext index fti(body) with parser space);
+insert into stopword_fast_path values (1, 'THE database database'), (2, 'the database café'), (3, 'the the the');
+select count(*) as hits from stopword_fast_path where match(body) against('database');
+select count(*) as hits from stopword_fast_path where match(body) against('café');
+select count(*) as hits from stopword_fast_path where match(body) against('the');
+drop table stopword_fast_path;
+
 --disable_warnings
 drop table if exists memo;
 --enable_warnings

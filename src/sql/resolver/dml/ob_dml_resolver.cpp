@@ -42,6 +42,15 @@
 #include "sql/resolver/ddl/ob_ddl_resolver.h"
 #include "sql/hybrid_search/ob_hybrid_search_executor.h"
 
+#include "lib/container/ob_vector.h"
+
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <fstream>
+#include <string>
+#include <vector>
+
 namespace oceanbase
 {
 using namespace common;
@@ -2712,6 +2721,13 @@ int ObDMLResolver::resolve_table(const ParseNode &parse_tree,
         }
         break;
       }
+      case T_READ_CSV_EXPRESSION: {
+        if (OB_ISNULL(session_info_)) {
+          ret = OB_INVALID_ARGUMENT;
+        } else if (OB_FAIL(resolve_read_csv_item(*table_node, table_item))) {
+        }
+        break;
+      }
       case T_HYBRID_SEARCH_EXPRESSION: {
         if (OB_ISNULL(session_info_)) {
           ret = OB_INVALID_ARGUMENT;
@@ -3922,6 +3938,798 @@ int ObDMLResolver::resolve_json_table_item(const ParseNode &parse_tree, TableIte
   }
   return ret;
 }
+
+// ---------------------------------------------------------------------------
+// file as database: the read_csv() table function.
+//
+// The file is read while the statement is resolved and the rows are then
+// handed to the optimizer as a values table, so the whole query (filter,
+// aggregation, sort and join) is still executed by the seekdb SQL engine.
+// ---------------------------------------------------------------------------
+namespace csv_scan
+{
+enum CsvType
+{
+  CSV_TYPE_NULL = 0,
+  CSV_TYPE_BOOL,
+  CSV_TYPE_INT,
+  CSV_TYPE_DOUBLE,
+  CSV_TYPE_DATE,
+  CSV_TYPE_DATETIME,
+  CSV_TYPE_VARCHAR
+};
+
+struct CsvCell
+{
+  const char *data_;
+  int64_t len_;
+  bool is_null_;
+};
+
+struct CsvColumn
+{
+  ObString name_;
+  CsvType type_;
+  bool nullable_;
+};
+
+struct CsvOptions
+{
+  CsvOptions()
+      : has_header_(true), delimiter_(','), quote_('"'), escape_('"'), nullstr_(NULL), nullstr_len_(0)
+  {}
+  bool has_header_;
+  char delimiter_;
+  char quote_;
+  char escape_;
+  const char *nullstr_;
+  int64_t nullstr_len_;
+};
+
+inline bool csv_is_digit(char c) { return c >= '0' && c <= '9'; }
+
+inline bool csv_equal_ignore_case(const char *data, int64_t len, const char *text)
+{
+  for (int64_t i = 0; i < len; ++i) {
+    char c = data[i];
+    if (c >= 'A' && c <= 'Z') {
+      c = static_cast<char>(c - 'A' + 'a');
+    }
+    if (c != text[i]) {
+      return false;
+    }
+  }
+  return true;
+}
+
+inline bool csv_try_bool(const char *data, int64_t len, bool &value)
+{
+  if (4 == len && csv_equal_ignore_case(data, len, "true")) {
+    value = true;
+    return true;
+  } else if (5 == len && csv_equal_ignore_case(data, len, "false")) {
+    value = false;
+    return true;
+  }
+  return false;
+}
+
+inline bool csv_try_int64(const char *data, int64_t len, int64_t &value)
+{
+  if (len <= 0 || len > 19) {
+    return false;
+  }
+  int64_t i = 0;
+  bool negative = false;
+  if ('-' == data[0] || '+' == data[0]) {
+    negative = ('-' == data[0]);
+    i = 1;
+    if (1 == len) {
+      return false;
+    }
+  }
+  int64_t result = 0;
+  for (; i < len; ++i) {
+    if (!csv_is_digit(data[i])) {
+      return false;
+    }
+    result = result * 10 + (data[i] - '0');
+  }
+  value = negative ? -result : result;
+  return true;
+}
+
+inline bool csv_try_double(const char *data, int64_t len, double &value)
+{
+  if (len <= 0 || len >= 63) {
+    return false;
+  }
+  char buffer[64];
+  MEMCPY(buffer, data, len);
+  buffer[len] = '\0';
+  char *end = NULL;
+  double parsed = strtod(buffer, &end);
+  if (NULL == end || end != buffer + len) {
+    return false;
+  }
+  value = parsed;
+  return true;
+}
+
+inline bool csv_is_leap_year(int64_t year)
+{
+  return (0 == year % 4 && 0 != year % 100) || 0 == year % 400;
+}
+
+inline int csv_days_in_month(int64_t year, int64_t month)
+{
+  static const int month_days[12] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+  if (2 == month && csv_is_leap_year(year)) {
+    return 29;
+  }
+  return month_days[month - 1];
+}
+
+// the number of days between 1970-01-01 and the given civil date
+inline int64_t csv_days_from_civil(int64_t year, int64_t month, int64_t day)
+{
+  year -= (month <= 2) ? 1 : 0;
+  const int64_t era = (year >= 0 ? year : year - 399) / 400;
+  const int64_t year_of_era = year - era * 400;
+  const int64_t day_of_year = (153 * (month + (month > 2 ? -3 : 9)) + 2) / 5 + day - 1;
+  const int64_t day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+  return era * 146097 + day_of_era - 719468;
+}
+
+inline bool csv_try_date(const char *data, int64_t len, int32_t &days)
+{
+  if (10 != len || '-' != data[4] || '-' != data[7]) {
+    return false;
+  }
+  int64_t year = 0;
+  int64_t month = 0;
+  int64_t day = 0;
+  for (int i = 0; i < 4; ++i) {
+    if (!csv_is_digit(data[i])) {
+      return false;
+    }
+    year = year * 10 + (data[i] - '0');
+  }
+  for (int i = 5; i < 7; ++i) {
+    if (!csv_is_digit(data[i])) {
+      return false;
+    }
+    month = month * 10 + (data[i] - '0');
+  }
+  for (int i = 8; i < 10; ++i) {
+    if (!csv_is_digit(data[i])) {
+      return false;
+    }
+    day = day * 10 + (data[i] - '0');
+  }
+  if (year < 1000 || year > 9999 || month < 1 || month > 12
+      || day < 1 || day > csv_days_in_month(year, month)) {
+    return false;
+  }
+  days = static_cast<int32_t>(csv_days_from_civil(year, month, day));
+  return true;
+}
+
+inline bool csv_try_datetime(const char *data, int64_t len, int64_t &usec)
+{
+  if (len < 19 || ' ' != data[10] || ':' != data[13] || ':' != data[16]) {
+    return false;
+  }
+  int32_t days = 0;
+  if (!csv_try_date(data, 10, days)) {
+    return false;
+  }
+  int64_t hour = 0;
+  int64_t minute = 0;
+  int64_t second = 0;
+  for (int i = 11; i < 13; ++i) {
+    if (!csv_is_digit(data[i])) {
+      return false;
+    }
+    hour = hour * 10 + (data[i] - '0');
+  }
+  for (int i = 14; i < 16; ++i) {
+    if (!csv_is_digit(data[i])) {
+      return false;
+    }
+    minute = minute * 10 + (data[i] - '0');
+  }
+  for (int i = 17; i < 19; ++i) {
+    if (!csv_is_digit(data[i])) {
+      return false;
+    }
+    second = second * 10 + (data[i] - '0');
+  }
+  if (hour > 23 || minute > 59 || second > 59) {
+    return false;
+  }
+  int64_t fraction = 0;
+  if (len > 19) {
+    if ('.' != data[19]) {
+      return false;
+    }
+    int64_t scale = 100000;
+    for (int64_t i = 20; i < len; ++i) {
+      if (!csv_is_digit(data[i])) {
+        return false;
+      }
+      if (scale > 0) {
+        fraction += (data[i] - '0') * scale;
+        scale /= 10;
+      }
+    }
+  }
+  usec = (static_cast<int64_t>(days) * 86400 + hour * 3600 + minute * 60 + second) * 1000000 + fraction;
+  return true;
+}
+
+inline CsvType csv_infer_type(const char *data, int64_t len)
+{
+  bool bool_value = false;
+  int64_t int_value = 0;
+  double double_value = 0;
+  int32_t date_value = 0;
+  int64_t datetime_value = 0;
+  if (csv_try_bool(data, len, bool_value)) {
+    return CSV_TYPE_BOOL;
+  } else if (csv_try_int64(data, len, int_value)) {
+    return CSV_TYPE_INT;
+  } else if (csv_try_double(data, len, double_value)) {
+    return CSV_TYPE_DOUBLE;
+  } else if (csv_try_date(data, len, date_value)) {
+    return CSV_TYPE_DATE;
+  } else if (csv_try_datetime(data, len, datetime_value)) {
+    return CSV_TYPE_DATETIME;
+  }
+  return CSV_TYPE_VARCHAR;
+}
+
+inline CsvType csv_merge_type(CsvType left, CsvType right)
+{
+  if (left == right) {
+    return left;
+  } else if (CSV_TYPE_NULL == left) {
+    return right;
+  } else if (CSV_TYPE_NULL == right) {
+    return left;
+  } else if (CSV_TYPE_VARCHAR == left || CSV_TYPE_VARCHAR == right) {
+    return CSV_TYPE_VARCHAR;
+  }
+  const bool left_is_number = (CSV_TYPE_BOOL == left || CSV_TYPE_INT == left || CSV_TYPE_DOUBLE == left);
+  const bool right_is_number = (CSV_TYPE_BOOL == right || CSV_TYPE_INT == right || CSV_TYPE_DOUBLE == right);
+  if (left_is_number && right_is_number) {
+    return (CSV_TYPE_DOUBLE == left || CSV_TYPE_DOUBLE == right) ? CSV_TYPE_DOUBLE : CSV_TYPE_INT;
+  }
+  // a date never mixes with a datetime or a number
+  return CSV_TYPE_VARCHAR;
+}
+
+struct CsvRecord
+{
+  std::vector<std::string> values_;
+  std::vector<char> quoted_;
+};
+
+// read one record, the fields are separated by the delimiter and a field may
+// be quoted, a quoted field may contain the delimiter, a line break and the
+// escaped quote character.
+inline int csv_read_record(const std::string &content, int64_t &pos, const CsvOptions &options,
+                           CsvRecord &record)
+{
+  const int64_t size = static_cast<int64_t>(content.size());
+  record.values_.clear();
+  record.quoted_.clear();
+  std::string field;
+  bool quoted = false;
+  bool in_quotes = false;
+  bool record_started = false;
+  bool record_done = false;
+  while (pos < size) {
+    const char c = content[pos];
+    if (in_quotes) {
+      if (c == options.escape_ && pos + 1 < size && content[pos + 1] == options.quote_) {
+        field.push_back(options.quote_);
+        pos += 2;
+        record_started = true;
+        continue;
+      } else if (c == options.quote_) {
+        in_quotes = false;
+        pos++;
+        record_started = true;
+        continue;
+      }
+      field.push_back(c);
+      pos++;
+      record_started = true;
+      continue;
+    }
+    if (c == options.quote_ && field.empty() && !quoted) {
+      in_quotes = true;
+      quoted = true;
+      pos++;
+      record_started = true;
+      continue;
+    }
+    if (c == options.delimiter_) {
+      record.values_.push_back(field);
+      record.quoted_.push_back(quoted ? 1 : 0);
+      field.clear();
+      quoted = false;
+      record_started = true;
+      pos++;
+      continue;
+    }
+    if ('\n' == c || '\r' == c) {
+      record.values_.push_back(field);
+      record.quoted_.push_back(quoted ? 1 : 0);
+      pos++;
+      if ('\r' == c && pos < size && '\n' == content[pos]) {
+        pos++;
+      }
+      record_done = true;
+      break;
+    }
+    field.push_back(c);
+    record_started = true;
+    pos++;
+  }
+  if (!record_done) {
+    if (!record_started) {
+      return OB_ITER_END;
+    }
+    record.values_.push_back(field);
+    record.quoted_.push_back(quoted ? 1 : 0);
+  }
+  return OB_SUCCESS;
+}
+
+inline int csv_copy_string(const std::string &text, ObIAllocator &allocator, ObString &value)
+{
+  int ret = OB_SUCCESS;
+  char *buf = static_cast<char *>(allocator.alloc(text.size() + 1));
+  if (OB_ISNULL(buf)) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+  } else {
+    if (!text.empty()) {
+      MEMCPY(buf, text.c_str(), text.size());
+    }
+    buf[text.size()] = '\0';
+    value.assign_ptr(buf, static_cast<ObString::obstr_size_t>(text.size()));
+  }
+  return ret;
+}
+
+// read the whole csv file and infer the type of every column
+inline int csv_read_file(const ObString &path, const CsvOptions &options, ObIAllocator &allocator,
+                         ObVector<CsvColumn> &columns, ObVector<CsvCell> &cells,
+                         int64_t &row_cnt, int64_t &column_cnt)
+{
+  int ret = OB_SUCCESS;
+  std::ifstream input;
+  input.open(path.ptr(), std::ios::in | std::ios::binary);
+  if (!input.is_open()) {
+    ret = OB_FILE_NOT_EXIST;
+    LOG_USER_ERROR(OB_FILE_NOT_EXIST);
+    return ret;
+  }
+  std::string content;
+  input.seekg(0, std::ios::end);
+  const std::streampos file_size = input.tellg();
+  input.seekg(0, std::ios::beg);
+  if (file_size > 0) {
+    content.resize(static_cast<size_t>(file_size));
+    input.read(&content[0], static_cast<std::streamsize>(file_size));
+    content.resize(static_cast<size_t>(input.gcount()));
+  }
+  std::vector<std::string> headers;
+  std::vector<std::string> values;
+  std::vector<char> quoted;
+  int64_t pos = 0;
+  CsvRecord record;
+  if (options.has_header_) {
+    if (OB_ITER_END == csv_read_record(content, pos, options, record)) {
+      // an empty file has no column at all
+      row_cnt = 0;
+      column_cnt = 0;
+      return OB_SUCCESS;
+    }
+    headers = record.values_;
+  }
+  while (true) {
+    const int read_ret = csv_read_record(content, pos, options, record);
+    if (OB_ITER_END == read_ret) {
+      break;
+    } else if (OB_FAIL(read_ret)) {
+      ret = read_ret;
+      break;
+    }
+    for (size_t i = 0; i < record.values_.size(); ++i) {
+      values.push_back(record.values_[i]);
+      quoted.push_back(record.quoted_[i]);
+    }
+  }
+  if (OB_FAIL(ret)) {
+    return ret;
+  }
+  const int64_t width = headers.empty()
+                        ? (values.empty() ? 0 : static_cast<int64_t>(values.size()))
+                        : static_cast<int64_t>(headers.size());
+  if (width <= 0) {
+    row_cnt = 0;
+    column_cnt = 0;
+    return OB_SUCCESS;
+  }
+  // the rows may be shorter or longer than the header
+  const int64_t value_cnt = static_cast<int64_t>(values.size());
+  const int64_t row_total = (value_cnt + width - 1) / width;
+  for (int64_t i = 0; OB_SUCC(ret) && i < width; ++i) {
+    CsvColumn column;
+    column.type_ = CSV_TYPE_NULL;
+    column.nullable_ = false;
+    if (options.has_header_ && i < static_cast<int64_t>(headers.size())) {
+      if (OB_FAIL(csv_copy_string(headers[i], allocator, column.name_))) {
+        break;
+      }
+    } else {
+      char buffer[32];
+      snprintf(buffer, sizeof(buffer), "column_%ld", static_cast<long>(i));
+      if (OB_FAIL(csv_copy_string(std::string(buffer), allocator, column.name_))) {
+        break;
+      }
+    }
+    for (int64_t row = 0; row < row_total; ++row) {
+      const int64_t index = row * width + i;
+      if (index >= value_cnt) {
+        column.nullable_ = true;
+        continue;
+      }
+      const std::string &text = values[index];
+      const bool is_quoted = 0 != quoted[index];
+      const bool is_null = !is_quoted
+                           && (text.empty()
+                               || (options.nullstr_ != NULL
+                                   && static_cast<int64_t>(text.size()) == options.nullstr_len_
+                                   && 0 == memcmp(text.c_str(), options.nullstr_, options.nullstr_len_)));
+      if (is_null) {
+        column.nullable_ = true;
+        continue;
+      }
+      const CsvType cell_type = csv_infer_type(text.c_str(), static_cast<int64_t>(text.size()));
+      column.type_ = csv_merge_type(column.type_, cell_type);
+    }
+    if (OB_SUCC(ret) && OB_FAIL(columns.push_back(column))) {
+      // keep the error
+    }
+  }
+  if (OB_FAIL(ret)) {
+    return ret;
+  }
+  // build the cells, the value of a column always uses the type of the column
+  for (int64_t row = 0; OB_SUCC(ret) && row < row_total; ++row) {
+    for (int64_t i = 0; OB_SUCC(ret) && i < width; ++i) {
+      const int64_t index = row * width + i;
+      CsvCell cell;
+      cell.data_ = NULL;
+      cell.len_ = 0;
+      cell.is_null_ = true;
+      if (index < value_cnt) {
+        const std::string &text = values[index];
+        const bool is_quoted = 0 != quoted[index];
+        const bool is_null = !is_quoted
+                             && (text.empty()
+                                 || (options.nullstr_ != NULL
+                                     && static_cast<int64_t>(text.size()) == options.nullstr_len_
+                                     && 0 == memcmp(text.c_str(), options.nullstr_, options.nullstr_len_)));
+        if (!is_null) {
+          ObString value;
+          if (OB_FAIL(csv_copy_string(text, allocator, value))) {
+            break;
+          }
+          cell.data_ = value.ptr();
+          cell.len_ = value.length();
+          cell.is_null_ = false;
+        }
+      }
+      if (OB_SUCC(ret) && OB_FAIL(cells.push_back(cell))) {
+        // keep the error
+      }
+    }
+  }
+  if (OB_SUCC(ret)) {
+    row_cnt = row_total;
+    column_cnt = width;
+  }
+  return ret;
+}
+
+} // namespace csv_scan
+
+int ObDMLResolver::resolve_read_csv_item(const ParseNode &parse_tree, TableItem *&table_item)
+{
+  int ret = OB_SUCCESS;
+  ObDMLStmt *stmt = get_stmt();
+  ObObj var_obj;
+  bool enabled = false;
+  const ParseNode *path_node = NULL;
+  const ParseNode *param_node = NULL;
+  const ParseNode *alias_node = NULL;
+  ObString path;
+  ObString alias_name;
+  csv_scan::CsvOptions options;
+  ObVector<csv_scan::CsvColumn> columns;
+  ObVector<csv_scan::CsvCell> cells;
+  int64_t row_cnt = 0;
+  int64_t column_cnt = 0;
+  TableItem *item = NULL;
+  ObValuesTableDef *table_def = NULL;
+  void *def_buf = NULL;
+
+  table_item = NULL;
+  if (OB_ISNULL(stmt) || OB_ISNULL(allocator_) || OB_ISNULL(session_info_)
+      || OB_ISNULL(params_.expr_factory_)) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("session info, allocator or stmt is null", K(ret));
+  } else if (OB_FAIL(session_info_->get_sys_variable(SYS_VAR_ENABLE_FILE_SQL, var_obj))) {
+    LOG_WARN("failed to read the enable_file_sql variable", K(ret));
+  } else if (FALSE_IT(enabled = var_obj.get_bool())) {
+  } else if (!enabled) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "read_csv(), set enable_file_sql = ON to use it");
+  } else if (3 != parse_tree.num_child_ || OB_ISNULL(parse_tree.children_[0])) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected read_csv expression", K(parse_tree.num_child_));
+  } else if (OB_FAIL(resolve_read_csv_options(*parse_tree.children_[1], options))) {
+    LOG_WARN("failed to resolve the read_csv options", K(ret));
+  } else if (OB_FAIL(resolve_str_const(*parse_tree.children_[0], path))) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_USER_ERROR(OB_INVALID_ARGUMENT, "read_csv(), the file path must be a string constant");
+  } else if (OB_FAIL(csv_scan::csv_read_file(path, options, *allocator_, columns, cells,
+                                            row_cnt, column_cnt))) {
+    LOG_WARN("failed to read the csv file", K(ret), K(path));
+  } else if (OB_ISNULL(item = stmt->create_table_item(*allocator_))) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+    LOG_WARN("failed to create the table item", K(ret));
+  } else if (OB_ISNULL(def_buf = allocator_->alloc(sizeof(ObValuesTableDef)))) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+    LOG_WARN("failed to allocate the values table definition", K(ret));
+  } else {
+    table_def = new (def_buf) ObValuesTableDef();
+    item->values_table_def_ = table_def;
+    item->type_ = TableItem::VALUES_TABLE;
+    item->table_id_ = generate_table_id();
+    item->is_view_table_ = false;
+    alias_node = parse_tree.children_[2];
+    if (OB_NOT_NULL(alias_node) && OB_NOT_NULL(alias_node->str_value_)) {
+      alias_name.assign_ptr(alias_node->str_value_, alias_node->str_len_);
+      item->table_name_ = alias_name;
+      item->alias_name_ = alias_name;
+    } else if (OB_FAIL(stmt->generate_values_table_name(*allocator_, alias_name))) {
+      LOG_WARN("failed to generate the values table name", K(ret));
+    } else {
+      item->table_name_ = alias_name;
+      item->alias_name_ = alias_name;
+    }
+    if (OB_SUCC(ret)) {
+      table_def->access_type_ = ObValuesTableDef::ACCESS_OBJ;
+      table_def->row_cnt_ = row_cnt;
+      table_def->column_cnt_ = column_cnt;
+      for (int64_t i = 0; OB_SUCC(ret) && i < column_cnt; ++i) {
+        ObRawExprResType res_type;
+        const csv_scan::CsvColumn &column = columns.at(i);
+        switch (column.type_) {
+          case csv_scan::CSV_TYPE_BOOL: {
+            res_type.set_type(ObTinyIntType);
+            break;
+          }
+          case csv_scan::CSV_TYPE_INT: {
+            res_type.set_type(ObIntType);
+            break;
+          }
+          case csv_scan::CSV_TYPE_DOUBLE: {
+            res_type.set_type(ObDoubleType);
+            break;
+          }
+          case csv_scan::CSV_TYPE_DATE: {
+            res_type.set_type(ObDateType);
+            break;
+          }
+          case csv_scan::CSV_TYPE_DATETIME: {
+            res_type.set_type(ObDateTimeType);
+            break;
+          }
+          default: {
+            res_type.set_type(ObVarcharType);
+            res_type.set_collation_type(ObCharset::get_default_collation_type());
+            break;
+          }
+        }
+        if (OB_FAIL(table_def->column_types_.push_back(res_type))) {
+          LOG_WARN("failed to add the column type", K(ret));
+        }
+      }
+    }
+    if (OB_SUCC(ret)) {
+      for (int64_t i = 0; OB_SUCC(ret) && i < cells.size(); ++i) {
+        ObObj value;
+        const csv_scan::CsvCell &cell = cells.at(i);
+        const ObRawExprResType &res_type = table_def->column_types_.at(i % (column_cnt > 0 ? column_cnt : 1));
+        if (cell.is_null_) {
+          value.set_null();
+        } else if (ObTinyIntType == res_type.get_type()) {
+          bool bool_value = false;
+          if (csv_scan::csv_try_bool(cell.data_, cell.len_, bool_value)) {
+            value.set_tinyint_value(static_cast<int8_t>(bool_value ? 1 : 0));
+          } else {
+            value.set_null();
+          }
+        } else if (ObIntType == res_type.get_type()) {
+          int64_t int_value = 0;
+          if (csv_scan::csv_try_int64(cell.data_, cell.len_, int_value)) {
+            value.set_int_value(int_value);
+          } else {
+            value.set_null();
+          }
+        } else if (ObDoubleType == res_type.get_type()) {
+          double double_value = 0;
+          if (csv_scan::csv_try_double(cell.data_, cell.len_, double_value)) {
+            value.set_double_value(double_value);
+          } else {
+            value.set_null();
+          }
+        } else if (ObDateType == res_type.get_type()) {
+          int32_t date_value = 0;
+          if (csv_scan::csv_try_date(cell.data_, cell.len_, date_value)) {
+            value.set_date_value(date_value);
+          } else {
+            value.set_null();
+          }
+        } else if (ObDateTimeType == res_type.get_type()) {
+          int64_t datetime_value = 0;
+          if (csv_scan::csv_try_datetime(cell.data_, cell.len_, datetime_value)) {
+            value.set_datetime_value(datetime_value);
+          } else {
+            value.set_null();
+          }
+        } else {
+          value.set_varchar(cell.data_, static_cast<ObString::obstr_size_t>(cell.len_));
+        }
+        ObObjParam param(value);
+        if (OB_FAIL(table_def->access_objs_.push_back(param))) {
+          LOG_WARN("failed to add the csv value", K(ret));
+        }
+      }
+    }
+    if (OB_SUCC(ret)) {
+      // the number of distinct values is only used by the optimizer
+      for (int64_t i = 0; OB_SUCC(ret) && i < column_cnt; ++i) {
+        if (OB_FAIL(table_def->column_ndvs_.push_back(row_cnt))) {
+          LOG_WARN("failed to add the column ndv", K(ret));
+        } else if (OB_FAIL(table_def->column_nnvs_.push_back(0))) {
+          LOG_WARN("failed to add the column nnv", K(ret));
+        }
+      }
+    }
+    if (OB_SUCC(ret)) {
+      for (int64_t i = 0; OB_SUCC(ret) && i < column_cnt; ++i) {
+        ObColumnRefRawExpr *column_expr = NULL;
+        if (OB_FAIL(params_.expr_factory_->create_raw_expr(T_REF_COLUMN, column_expr))) {
+          LOG_WARN("failed to create the column expression", K(ret));
+        } else if (OB_ISNULL(column_expr)) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("the column expression is null", K(ret));
+        } else {
+          column_expr->set_result_type(table_def->column_types_.at(i));
+          column_expr->set_ref_id(item->table_id_, i + OB_APP_MIN_COLUMN_ID);
+          column_expr->set_column_attr(item->table_name_, columns.at(i).name_);
+          if (OB_FAIL(column_expr->add_flag(IS_COLUMN))) {
+            LOG_WARN("failed to mark the column expression", K(ret));
+          } else {
+            ColumnItem column_item;
+            column_item.expr_ = column_expr;
+            column_item.table_id_ = column_expr->get_table_id();
+            column_item.column_id_ = column_expr->get_column_id();
+            column_item.column_name_ = column_expr->get_column_name();
+            if (OB_FAIL(stmt->add_column_item(column_item))) {
+              LOG_WARN("failed to add the column item", K(ret));
+            }
+          }
+        }
+      }
+    }
+    if (OB_SUCC(ret) && OB_FAIL(stmt->add_table_item(session_info_, item))) {
+      LOG_WARN("failed to add the table item", K(ret));
+    }
+    table_item = item;
+  }
+  return ret;
+}
+
+int ObDMLResolver::resolve_read_csv_options(const ParseNode &param_node, csv_scan::CsvOptions &options)
+{
+  int ret = OB_SUCCESS;
+  const ParseNode *param = NULL;
+  if (OB_ISNULL(param_node)) {
+    // no option
+  } else if (T_LINK_NODE != param_node->type_) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected read_csv option list", K(param_node->type_));
+  } else {
+    for (int64_t i = 0; OB_SUCC(ret) && i < param_node->num_child_; ++i) {
+      param = param_node->children_[i];
+      if (OB_ISNULL(param) || T_LINK_NODE != param->type_ || 2 != param->num_child_
+          || OB_ISNULL(param->children_[0]) || OB_ISNULL(param->children_[1])) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("unexpected read_csv option", K(param));
+        break;
+      }
+      const ParseNode *name_node = param->children_[0];
+      const ParseNode *value_node = param->children_[1];
+      ObString name;
+      if (OB_NOT_NULL(name_node->str_value_)) {
+        name.assign_ptr(name_node->str_value_, name_node->str_len_);
+      }
+      if (0 == name.length()) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("the read_csv option has no name", K(ret));
+      } else if (OB_FAIL(resolve_read_csv_option(name, *value_node, options))) {
+        LOG_WARN("failed to resolve the read_csv option", K(ret), K(name));
+      }
+    }
+  }
+  return ret;
+}
+
+int ObDMLResolver::resolve_read_csv_option(const ObString &name, const ParseNode &value_node,
+                                            csv_scan::CsvOptions &options)
+{
+  int ret = OB_SUCCESS;
+  ObString text;
+  if (0 == name.compare("header")) {
+    if (T_BOOL == value_node.type_ || T_INT == value_node.type_) {
+      options.has_header_ = (0 != value_node.value_);
+    } else {
+      ret = OB_NOT_SUPPORTED;
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "read_csv(), the header option must be a boolean");
+    }
+  } else if (0 == name.compare("sample_size")) {
+    // the whole file is always scanned
+    if (T_INT != value_node.type_ || -1 != value_node.value_) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "read_csv(), only sample_size = -1 is supported");
+    }
+  } else if (0 == name.compare("delimiter") || 0 == name.compare("quote")) {
+    if (OB_FAIL(resolve_str_const(value_node, text))) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "read_csv(), the option must be a string");
+    } else if (1 != text.length()) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "read_csv(), the option must be a single character");
+    } else if (0 == name.compare("delimiter")) {
+      options.delimiter_ = text.ptr()[0];
+    } else {
+      options.quote_ = text.ptr()[0];
+      options.escape_ = text.ptr()[0];
+    }
+  } else if (0 == name.compare("nullstr")) {
+    if (OB_FAIL(resolve_str_const(value_node, text))) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "read_csv(), the nullstr must be a string");
+    } else {
+      options.nullstr_ = text.ptr();
+      options.nullstr_len_ = text.length();
+    }
+  } else {
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "read_csv(), the option is not supported");
+  }
+  return ret;
+}
+
 
 int ObDMLResolver::resolve_function_table_item(const ParseNode &parse_tree,
                                                TableItem *&tbl_item)

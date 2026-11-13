@@ -355,9 +355,11 @@ public:
    int call_completion(ObString &prompt, ObJsonObject *config, ObString &result);
    int call_completion_vector(ObArray<ObString> &prompts, ObJsonObject *config, ObArray<ObString> &results);
    // dense_embedding
-   int call_dense_embedding(ObString &content, ObJsonObject *config, ObString &result);
+   int call_dense_embedding(ObString &content, ObJsonObject *config, ObString &result, int64_t validate_dimension = 0);
    int call_dense_embedding_vector(ObArray<ObString> &contents, ObJsonObject *config, ObArray<ObString> &results);
-   int call_dense_embedding_vector_v2(ObArray<ObString> &contents, ObJsonObject *config, ObArray<ObString> &results);
+   // validate_dimension is the dimension the returned vector has to have, zero
+   // means that the dimension of the answer is not checked.
+   int call_dense_embedding_vector_v2(ObArray<ObString> &contents, ObJsonObject *config, ObArray<ObString> &results, int64_t validate_dimension = 0);
    // rerank
    int call_rerank(ObString &query, ObJsonArray *contents, ObJsonArray *&results);
  private:

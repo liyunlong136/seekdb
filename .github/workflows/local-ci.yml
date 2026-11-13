@@ -1,0 +1,302 @@
+name: seekdb local ci
+
+# Development-only pipeline used to build seekdb on Linux and replay the
+# official competition mysqltest suites.  It is kept on a dedicated branch so
+# the competition branch that is submitted to the judge stays free of
+# pipeline-only files.
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "branch or sha to build"
+        required: false
+        default: "competition/seekdb-2026"
+      suite:
+        description: "mysqltest suite to replay (empty = build only)"
+        required: false
+        default: ""
+      bench:
+        description: "also run the fulltext benchmark (0 = no)"
+        required: false
+        default: "1"
+      cases:
+        description: "mysqltest cases to replay (space separated)"
+        required: false
+        default: "ai_function_enhancement ai_prompt"
+  push:
+    branches:
+      - "ci/local-build"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: seekdb-local-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  BUILD_DIR: build_release
+  SEEKDB_BIN: build_release/src/observer/seekdb
+
+jobs:
+  build:
+    name: build observer
+    runs-on: ubuntu-22.04
+    timeout-minutes: 330
+    steps:
+      - name: Free disk space
+        uses: insightsengineering/disk-space-reclaimer@v1
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          swap-storage: true
+          docker-images: true
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || 'competition/seekdb-2026' }}
+          fetch-depth: 1
+
+      - name: Report disk
+        shell: bash
+        run: df -h / /home
+
+      - name: Install ubuntu environment
+        shell: bash
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          sudo apt-get update
+          sudo apt-get install -y git wget curl rpm rpm2cpio cpio make build-essential \
+            binutils m4 libtool-bin libncurses5 libncurses-dev libaio-dev \
+            python3 python3-pip perl ccache mysql-client
+
+      - name: Cache third party dependencies
+        uses: actions/cache@v4
+        with:
+          path: deps/3rd
+          key: ${{ runner.os }}-ob-deps-${{ hashFiles('deps/init/oceanbase.el9.x86_64.deps') }}
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ccache
+          key: ccache-${{ github.run_id }}
+          restore-keys: |
+            ccache-
+
+      - name: Setup Rust
+        uses: ./.github/actions/setup-rust
+
+      - name: Init dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./build.sh release --init
+
+      - name: Build
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S . -B "$BUILD_DIR" \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+          make -C "$BUILD_DIR" -j"$(nproc)" seekdb
+          test -x "$SEEKDB_BIN"
+          ls -la "$BUILD_DIR/src/observer/"
+
+      - name: Upload observer binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: seekdb-observer
+          path: |
+            build_release/src/observer/seekdb
+            build_release/src/observer/observer
+          retention-days: 5
+          if-no-files-found: error
+
+  mysqltest:
+    name: mysqltest ${{ inputs.suite || 'ai_function' }}
+    needs: build
+    if: ${{ always() && needs.build.result == 'success' }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || 'competition/seekdb-2026' }}
+          fetch-depth: 1
+
+      - name: Install mysql client and python driver
+        shell: bash
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          sudo apt-get update
+          sudo apt-get install -y mysql-client python3-pip
+          pip3 install --quiet pymysql==1.1.1
+
+      - name: Download observer
+        uses: actions/download-artifact@v4
+        with:
+          name: seekdb-observer
+          path: observer
+
+      - name: Start mock AI service
+        shell: bash
+        run: |
+          set -euo pipefail
+          nohup python3 tools/local_ci/mock_ai_service.py --port 8000 \
+            > /tmp/mock_ai.log 2>&1 &
+          for i in $(seq 1 30); do
+            if curl -s -o /dev/null http://127.0.0.1:8000/healthz; then
+              echo "mock ai service is up"
+              break
+            fi
+            sleep 1
+          done
+          echo "--- smoke test /api/generate ---"
+          curl -s -X POST -H 'Content-Type: application/json' \
+            -d '{"model":"qwen2.5","prompt":"hello"}' \
+            http://127.0.0.1:8000/api/generate | head -c 300
+          echo
+          echo "--- smoke test /api/embed ---"
+          curl -s -X POST -H 'Content-Type: application/json' \
+            -d '{"model":"nomic","input":["hello"]}' \
+            http://127.0.0.1:8000/api/embed | head -c 120
+          echo
+
+      - name: Start observer
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash tools/local_ci/start_observer.sh observer
+
+      - name: Diagnose the ollama completion
+        if: always()
+        continue-on-error: true
+        shell: bash
+        run: |
+          mysql -h127.0.0.1 -P2881 -uroot --default-character-set=utf8mb4 -e "
+          create database if not exists diag;
+          use diag;
+          call DBMS_AI_SERVICE.CREATE_AI_MODEL('diag_ollama','{\"type\":\"completion\",\"model_name\":\"qwen2.5\"}');
+          call DBMS_AI_SERVICE.CREATE_AI_MODEL_ENDPOINT('diag_ollama_ep','{\"ai_model_name\":\"diag_ollama\",\"scope\":\"all\",\"url\":\"http://0.0.0.0:8000/api/generate\",\"access_key\":\"\",\"provider\":\"ollama\"}');
+          select ENDPOINT_NAME, AI_MODEL_NAME, URL, ACCESS_KEY, PROVIDER, REQUEST_MODEL_NAME, PARAMETERS, SCOPE from oceanbase.DBA_OB_AI_MODEL_ENDPOINTS where ENDPOINT_NAME='diag_ollama_ep';
+          select ai_complete('diag_ollama','hello') as r;
+          call DBMS_AI_SERVICE.ALTER_AI_MODEL_ENDPOINT('diag_ollama_ep','{\"provider\":\"Ollama\"}');
+          select ENDPOINT_NAME, AI_MODEL_NAME, URL, ACCESS_KEY, PROVIDER, REQUEST_MODEL_NAME, PARAMETERS, SCOPE from oceanbase.DBA_OB_AI_MODEL_ENDPOINTS where ENDPOINT_NAME='diag_ollama_ep';
+          select ai_complete('diag_ollama','hello') as r2;
+          select @@session.enable_file_sql as file_sql_default;
+          set session enable_file_sql = on;
+          select @@session.enable_file_sql as file_sql_on;
+          " 2>&1 | tail -25
+
+      - name: Probe the read_csv parser
+        if: always()
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          MYSQL="mysql -h127.0.0.1 -P2881 -uroot --default-character-set=utf8mb4 -A"
+          probe() {
+            echo "--- $1"
+            $MYSQL -e "$2" 2>&1 | tail -3
+            echo "exit=$?"
+          }
+          printf 'id,name,score\n1,alpha,1.5\n2,beta,2.5\n' > /tmp/basic.csv
+          probe "switch off: expect ERROR 1235" "select count(*) from read_csv('/tmp/basic.csv')"
+          probe "switch on: expect ERROR 1235 for now" "set session enable_file_sql=on; select count(*) from read_csv('/tmp/basic.csv')"
+          probe "legacy 2nd positional: expect ERROR 1064" "select * from read_csv('/tmp/basic.csv', 'xml')"
+          probe "unknown named param parses: expect ERROR 1235" "select * from read_csv('/tmp/basic.csv', sample_size = 10)"
+
+      - name: Run mysqltest suite
+        shell: bash
+        env:
+          SUITE: ${{ inputs.suite || 'ai_function' }}
+          CASES: ${{ inputs.cases || 'ai_function_enhancement ai_prompt' }}
+        run: |
+          set -euo pipefail
+          arguments=(--suite "$SUITE")
+          for case_id in $CASES; do
+            arguments+=(--case "$case_id")
+          done
+          python3 tools/local_ci/run_mysqltest.py "${arguments[@]}"
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mysqltest-logs
+          path: |
+            /tmp/seekdb_local_ci
+            /tmp/seekdb.log
+            /tmp/mock_ai.log
+            /tmp/seekdb_home/log
+          retention-days: 5
+          if-no-files-found: ignore
+
+  fts-bench:
+    name: fulltext benchmark
+    needs: build
+    if: ${{ always() && needs.build.result == 'success' }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || 'competition/seekdb-2026' }}
+          fetch-depth: 1
+
+      - name: Install mysql client
+        shell: bash
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          sudo apt-get update
+          sudo apt-get install -y mysql-client python3 python3-pip
+          pip3 install --quiet pymysql==1.1.1
+
+      - name: Download observer
+        uses: actions/download-artifact@v4
+        with:
+          name: seekdb-observer
+          path: observer
+
+      - name: Start observer
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash tools/local_ci/start_observer.sh observer
+
+      - name: Profile the tokenize hot path
+        shell: bash
+        run: |
+          set -euo pipefail
+          pip3 install --quiet pymysql==1.1.1
+          python3 tools/local_ci/profile_tokenize.py --rounds 300 | tee /tmp/tokenize-profile.txt
+
+      - name: Run fulltext benchmark
+        shell: bash
+        run: |
+          set -euo pipefail
+          export MYSQL='mysql -h127.0.0.1 -P2881 -uroot -N -s --default-character-set=utf8mb4'
+          export MYSQL_VERBOSE='mysql -h127.0.0.1 -P2881 -uroot --default-character-set=utf8mb4'
+          REPORT_FILE=/tmp/fts-bench-report.txt
+          LABEL=local ROWS=20000 BATCH=500 ROUNDS=3000 QUERY_ROUNDS=200 \
+            SAMPLES=3 WARMUP=30 SKIP_LOAD=0 OUTPUT="$REPORT_FILE" \
+            bash tools/benchmark/fts_large_bench.sh
+          python3 tools/benchmark/fts_large_bench_score.py "$REPORT_FILE" --json
+
+      - name: Upload benchmark report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fts-bench-report
+          path: |
+            /tmp/fts-bench-report.txt
+            /tmp/tokenize-profile.txt
+            /tmp/seekdb.log
+            /tmp/seekdb_home/log
+          retention-days: 5
+          if-no-files-found: ignore

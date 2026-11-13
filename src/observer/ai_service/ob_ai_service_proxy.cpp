@@ -32,12 +32,17 @@ using namespace oceanbase::common;
 using namespace oceanbase::sqlclient;
 using namespace oceanbase::transaction;
 
+
 int ObAiServiceProxy::insert_ai_endpoint(ObMySQLTransaction &trans, const int64_t new_endpoint_version, const ObAiModelEndpointInfo &endpoint)
 {
   int ret = OB_SUCCESS;
   int64_t affected_rows = 0;
   ObDMLSqlSplicer sql;
   ObSqlString buffer;
+  // An endpoint may run without an access key (ollama for instance).  It must
+  // be stored as an empty string: a null value makes the read back endpoint
+  // fail with the null value error.
+  ObString access_key = endpoint.access_key_.empty() ? ObString(0, "") : endpoint.access_key_;
   
   if (OB_FAIL(sql.add_pk_column("endpoint_id", endpoint.endpoint_id_))) {
   } else if (OB_FAIL(sql.add_pk_column("scope", ObHexEscapeSqlStr(endpoint.scope_)))) {
@@ -45,7 +50,7 @@ int ObAiServiceProxy::insert_ai_endpoint(ObMySQLTransaction &trans, const int64_
   } else if (OB_FAIL(sql.add_column("endpoint_name", endpoint.name_))) {
   } else if (OB_FAIL(sql.add_column("ai_model_name", ObHexEscapeSqlStr(endpoint.ai_model_name_)))) {
   } else if (OB_FAIL(sql.add_column("url", ObHexEscapeSqlStr(endpoint.url_)))) {
-  } else if (OB_FAIL(sql.add_column("access_key", ObHexEscapeSqlStr(endpoint.access_key_)))) {
+  } else if (OB_FAIL(sql.add_column("access_key", ObHexEscapeSqlStr(access_key)))) {
   } else if (OB_FAIL(sql.add_column("request_model_name", ObHexEscapeSqlStr(endpoint.request_model_name_)))) {
   } else if (OB_FAIL(sql.add_column("provider", ObHexEscapeSqlStr(endpoint.provider_)))) {
   } else if (OB_FAIL(sql.add_column("parameters", ObHexEscapeSqlStr(endpoint.parameters_)))) {
@@ -70,6 +75,10 @@ int ObAiServiceProxy::update_ai_endpoint(ObMySQLTransaction &trans, const int64_
   ObDMLSqlSplicer sql;
   ObSqlString buffer;
   int64_t affected_rows = 0;
+  // An endpoint may run without an access key (ollama for instance).  It must
+  // be stored as an empty string: a null value makes the read back endpoint
+  // fail with the null value error.
+  ObString access_key = endpoint.access_key_.empty() ? ObString(0, "") : endpoint.access_key_;
   
   if (OB_FAIL(sql.add_pk_column("endpoint_id", endpoint.endpoint_id_))) {
   } else if (OB_FAIL(sql.add_pk_column("scope", ObHexEscapeSqlStr(endpoint.scope_)))) {
@@ -77,7 +86,7 @@ int ObAiServiceProxy::update_ai_endpoint(ObMySQLTransaction &trans, const int64_
   } else if (OB_FAIL(sql.add_column("endpoint_name", endpoint.name_))) {
   } else if (OB_FAIL(sql.add_column("ai_model_name", ObHexEscapeSqlStr(endpoint.ai_model_name_)))) {
   } else if (OB_FAIL(sql.add_column("url", ObHexEscapeSqlStr(endpoint.url_)))) {
-  } else if (OB_FAIL(sql.add_column("access_key", ObHexEscapeSqlStr(endpoint.access_key_)))) {
+  } else if (OB_FAIL(sql.add_column("access_key", ObHexEscapeSqlStr(access_key)))) {
   } else if (OB_FAIL(sql.add_column("request_model_name", ObHexEscapeSqlStr(endpoint.request_model_name_)))) {
   } else if (OB_FAIL(sql.add_column("provider", ObHexEscapeSqlStr(endpoint.provider_)))) {
   } else if (OB_FAIL(sql.add_column("parameters", ObHexEscapeSqlStr(endpoint.parameters_)))) {
@@ -200,7 +209,7 @@ int ObAiServiceProxy::build_ai_endpoint_(ObArenaAllocator &allocator, ObMySQLRes
   EXTRACT_VARCHAR_FIELD_MYSQL(result, "endpoint_name", name);
   EXTRACT_VARCHAR_FIELD_MYSQL(result, "ai_model_name", ai_model_name);
   EXTRACT_VARCHAR_FIELD_MYSQL(result, "url", url);
-  EXTRACT_VARCHAR_FIELD_MYSQL(result, "access_key", access_key);
+  EXTRACT_VARCHAR_FIELD_MYSQL_WITH_DEFAULT_VALUE(result, "access_key", access_key, true, false, ""/*wont be used*/);
   EXTRACT_VARCHAR_FIELD_MYSQL_WITH_DEFAULT_VALUE(result, "provider", provider, true, false, ""/*wont be used*/);
   EXTRACT_VARCHAR_FIELD_MYSQL_WITH_DEFAULT_VALUE(result, "request_model_name", request_model_name, true, false, ""/*wont be used*/);
   EXTRACT_VARCHAR_FIELD_MYSQL_WITH_DEFAULT_VALUE(result, "parameters", arguments, true, false, ""/*wont be used*/);
@@ -238,10 +247,7 @@ int ObAiServiceProxy::drop_ai_model_endpoint(ObMySQLTransaction &trans, const Ob
       OB_ALL_AI_MODEL_ENDPOINT_TNAME))) {
   } else if (OB_FAIL(sql_append_hex_escape_str(name, sql))) {
   } else if (OB_FAIL(trans.write(sql.ptr(), affected_rows))) {
-  } else if (0 == affected_rows) {
-    ret = OB_AI_FUNC_ENDPOINT_NOT_FOUND;
-    LOG_USER_ERROR(OB_AI_FUNC_ENDPOINT_NOT_FOUND, name.length(), name.ptr());
-  } else if (1 != affected_rows) {
+  } else if (1 < affected_rows) {
     ret = OB_ERR_UNEXPECTED;
   }
   return ret;
