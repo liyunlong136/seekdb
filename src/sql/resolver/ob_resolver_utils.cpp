@@ -1683,6 +1683,10 @@ stmt::StmtType ObResolverUtils::get_stmt_type_by_item_type(const ObItemType item
       SET_STMT_TYPE(T_DELETE);
       SET_STMT_TYPE(T_UPDATE);
       SET_STMT_TYPE(T_REPLACE);
+      // COPY (select ...) TO ... is turned into a select with an into clause
+      case T_COPY_STMT: {
+        type = stmt::T_SELECT;
+      } break;
       // ps
       SET_STMT_TYPE(T_PREPARE);
       SET_STMT_TYPE(T_EXECUTE);

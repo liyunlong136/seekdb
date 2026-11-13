@@ -943,6 +943,23 @@ int ObSelectIntoOp::print_field(const ObObj &obj, ObCsvFileWriter &data_writer)
   return ret;
 }
 
+int ObSelectIntoOp::write_header_line(ObCsvFileWriter &data_writer)
+{
+  int ret = OB_SUCCESS;
+  const ObIArray<ObString> &names = MY_SPEC.user_vars_;
+  for (int64_t i = 0; OB_SUCC(ret) && i < names.count(); ++i) {
+    ObObj obj;
+    obj.set_varchar(names.at(i));
+    obj.set_collation_type(cs_type_);
+    if (OB_FAIL(print_field(obj, data_writer))) {
+    } else if (i != names.count() - 1 && OB_FAIL(write_obj_to_file(field_str_, data_writer))) {
+    }
+  }
+  if (OB_SUCC(ret) && OB_FAIL(write_obj_to_file(line_str_, data_writer))) {
+  }
+  return ret;
+}
+
 int ObSelectIntoOp::into_outfile(ObExternalFileWriter *data_writer)
 {
   int ret = OB_SUCCESS;
@@ -952,6 +969,12 @@ int ObSelectIntoOp::into_outfile(ObExternalFileWriter *data_writer)
   ObCsvFileWriter *csv_data_writer = NULL;
   if (OB_ISNULL(csv_data_writer = static_cast<ObCsvFileWriter *>(data_writer))) {
     ret = OB_ERR_UNEXPECTED;
+  } else if (!header_written_) {
+    // a COPY hands the output column names over through the user vars
+    if (!MY_SPEC.user_vars_.empty() && OB_FAIL(write_header_line(*csv_data_writer))) {
+    } else {
+      header_written_ = true;
+    }
   }
   for (int64_t i = 0; OB_SUCC(ret) && i < select_exprs.count(); ++i) {
     if (OB_ISNULL(select_exprs.at(i))) {
@@ -992,6 +1015,14 @@ int ObSelectIntoOp::into_outfile_batch_csv(const ObBatchRows &brs, ObExternalFil
   ObDatum *datum = NULL;
   ObObj obj;
   ObCsvFileWriter *csv_data_writer = NULL;
+  if (!header_written_ && OB_NOT_NULL(data_writer)) {
+    if (OB_ISNULL(csv_data_writer = static_cast<ObCsvFileWriter *>(data_writer))) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (!MY_SPEC.user_vars_.empty() && OB_FAIL(write_header_line(*csv_data_writer))) {
+    } else {
+      header_written_ = true;
+    }
+  }
   for (int64_t i = 0; OB_SUCC(ret) && i < select_exprs.count(); ++i) {
     if (OB_FAIL(select_exprs.at(i)->eval_batch(eval_ctx_, *brs.skip_, brs.size_))) {
     } else if (OB_FAIL(datum_vectors.push_back(select_exprs.at(i)->locate_expr_datumvector(eval_ctx_)))) {

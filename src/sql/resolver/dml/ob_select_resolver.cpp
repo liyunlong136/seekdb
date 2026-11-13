@@ -16,6 +16,7 @@
 
 #define USING_LOG_PREFIX SQL_RESV
 #include "sql/resolver/dml/ob_select_resolver.h"
+#include "sql/resolver/ob_resolver.h"
 #include "sql/resolver/dml/ob_del_upd_resolver.h"
 #include "share/ob_time_utility2.h"
 #include "sql/resolver/dml/ob_aggr_expr_push_up_analyzer.h"
@@ -4668,6 +4669,184 @@ int ObSelectResolver::resolve_values_table_from_union(const ObIArray<int64_t> &l
                                                            table_def->access_exprs_,
                                                            &table_def->column_types_))) {
     } else if (OB_FAIL(estimate_values_table_stats(*table_def))) {
+    }
+  }
+  return ret;
+}
+
+// Map the type of an inferred file column onto the type name that
+// "describe select * from file_table_function(...)" has to print.
+static const char *file_sql_type_name(const ObObjType type)
+{
+  const char *name = "VARCHAR";
+  switch (type) {
+    case ObTinyIntType: name = "BOOLEAN"; break;
+    case ObSmallIntType: name = "SMALLINT"; break;
+    case ObInt32Type: name = "INTEGER"; break;
+    case ObIntType: name = "BIGINT"; break;
+    case ObFloatType: name = "FLOAT"; break;
+    case ObDoubleType: name = "DOUBLE"; break;
+    case ObNumberType: name = "DECIMAL"; break;
+    case ObDateType: name = "DATE"; break;
+    case ObDateTimeType: name = "DATETIME"; break;
+    case ObTimeType: name = "TIME"; break;
+    case ObYearType: name = "YEAR"; break;
+    default: name = "VARCHAR"; break;
+  }
+  return name;
+}
+
+int ObFileDescribeResolver::resolve(const ParseNode &parse_tree)
+{
+  int ret = OB_SUCCESS;
+  ObSelectStmt *describe_stmt = NULL;
+  ObStmt *file_stmt = NULL;
+  ObResolver sub_resolver(params_);
+  if (OB_ISNULL(describe_stmt = create_stmt<ObSelectStmt>())) {
+    ret = OB_SQL_RESOLVER_NO_MEMORY;
+    LOG_WARN("failed to create the describe statement", K(ret));
+  } else if (OB_FAIL(sub_resolver.resolve(ObResolver::IS_NOT_PREPARED_STMT, parse_tree, file_stmt))) {
+    LOG_WARN("failed to resolve the described statement", K(ret));
+  } else if (OB_ISNULL(file_stmt) || !file_stmt->is_select_stmt()) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "describe, the statement must be a select statement");
+  } else if (OB_FAIL(build_describe_rows(*static_cast<ObSelectStmt *>(file_stmt), *describe_stmt))) {
+    LOG_WARN("failed to build the describe result", K(ret));
+  }
+  return ret;
+}
+
+int ObFileDescribeResolver::build_describe_rows(ObSelectStmt &file_stmt, ObSelectStmt &describe_stmt)
+{
+  int ret = OB_SUCCESS;
+  static const char *const COLUMN_NAMES[] = {
+    "column_name", "column_type", "null", "key", "default", "extra"
+  };
+  const int64_t describe_column_cnt = 6;
+  ObIArray<TableItem *> &tables = file_stmt.get_table_items();
+  ObIArray<ColumnItem> &columns = file_stmt.get_column_items();
+  TableItem *file_table = NULL;
+  ObValuesTableDef *file_def = NULL;
+  ObValuesTableDef *def = NULL;
+  TableItem *table_item = NULL;
+  void *def_buf = NULL;
+  ObString table_name;
+  int64_t row_cnt = 0;
+  if (1 != tables.count()) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "describe, the statement must read exactly one file");
+  } else if (OB_ISNULL(file_table = tables.at(0))
+             || TableItem::VALUES_TABLE != file_table->type_
+             || OB_ISNULL(file_def = file_table->values_table_def_)) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "describe, the statement must read a file");
+  } else if ((row_cnt = file_def->column_cnt_) <= 0
+             || columns.count() < row_cnt
+             || file_def->column_types_.count() < row_cnt) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("the file table has no column", K(ret), K(row_cnt), K(columns.count()));
+  } else if (OB_ISNULL(def_buf = allocator_->alloc(sizeof(ObValuesTableDef)))
+             || OB_ISNULL(table_item = describe_stmt.create_table_item(*allocator_))) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+    LOG_WARN("failed to allocate the describe table", K(ret));
+  } else if (OB_FAIL(describe_stmt.generate_values_table_name(*allocator_, table_name))) {
+    LOG_WARN("failed to generate the describe table name", K(ret));
+  } else {
+    def = new (def_buf) ObValuesTableDef();
+    table_item->values_table_def_ = def;
+    table_item->type_ = TableItem::VALUES_TABLE;
+    table_item->table_id_ = generate_table_id();
+    table_item->is_view_table_ = false;
+    table_item->table_name_ = table_name;
+    table_item->alias_name_ = table_name;
+    def->access_type_ = ObValuesTableDef::ACCESS_EXPR;
+    def->is_const_ = true;
+    def->row_cnt_ = row_cnt;
+    def->column_cnt_ = describe_column_cnt;
+  }
+  // the six description columns are all text
+  for (int64_t i = 0; OB_SUCC(ret) && i < describe_column_cnt; ++i) {
+    ObRawExprResType res_type;
+    res_type.set_type(ObVarcharType);
+    res_type.set_collation_type(ObCharset::get_system_collation());
+    res_type.set_length(256);
+    if (OB_FAIL(def->column_types_.push_back(res_type))) {
+      LOG_WARN("failed to add the describe column type", K(ret));
+    }
+  }
+  // one row per inferred column of the file
+  for (int64_t i = 0; OB_SUCC(ret) && i < row_cnt; ++i) {
+    ObObj row_values[describe_column_cnt];
+    const char *type_name = file_sql_type_name(file_def->column_types_.at(i).get_type());
+    bool nullable = true;
+    if (OB_NOT_NULL(columns.at(i).expr_)) {
+      nullable = !columns.at(i).expr_->get_result_type().has_result_flag(NOT_NULL_FLAG);
+    }
+    row_values[0].set_varchar(columns.at(i).column_name_);
+    row_values[1].set_varchar(ObString(static_cast<int32_t>(STRLEN(type_name)), type_name));
+    row_values[2].set_varchar(nullable ? ObString::make_string("YES") : ObString::make_string("NO"));
+    for (int64_t c = 0; c < describe_column_cnt; ++c) {
+      if (c < 3) {
+        row_values[c].set_collation_type(ObCharset::get_system_collation());
+      } else {
+        row_values[c].set_null();
+      }
+    }
+    for (int64_t c = 0; OB_SUCC(ret) && c < describe_column_cnt; ++c) {
+      ObConstRawExpr *const_expr = NULL;
+      if (OB_FAIL(ObRawExprUtils::build_const_obj_expr(*params_.expr_factory_,
+                                                       row_values[c], const_expr))) {
+        LOG_WARN("failed to build the describe value", K(ret));
+      } else if (OB_ISNULL(const_expr)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("the describe value is null", K(ret));
+      } else if (OB_FAIL(const_expr->formalize(session_info_))) {
+        LOG_WARN("failed to formalize the describe value", K(ret));
+      } else if (OB_FAIL(def->access_exprs_.push_back(const_expr))) {
+        LOG_WARN("failed to add the describe value", K(ret));
+      }
+    }
+  }
+  if (OB_SUCC(ret) && OB_FAIL(estimate_values_table_stats(*def))) {
+    LOG_WARN("failed to estimate the describe table stats", K(ret));
+  }
+  // the table item has to be registered before its column items
+  if (OB_SUCC(ret) && OB_FAIL(describe_stmt.add_table_item(session_info_, table_item))) {
+    LOG_WARN("failed to add the describe table item", K(ret));
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i < describe_column_cnt; ++i) {
+    ObColumnRefRawExpr *column_expr = NULL;
+    if (OB_FAIL(params_.expr_factory_->create_raw_expr(T_REF_COLUMN, column_expr))) {
+      LOG_WARN("failed to create the describe column expression", K(ret));
+    } else if (OB_ISNULL(column_expr)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("the describe column expression is null", K(ret));
+    } else {
+      column_expr->set_result_type(def->column_types_.at(i));
+      column_expr->set_ref_id(table_item->table_id_, i + OB_APP_MIN_COLUMN_ID);
+      column_expr->set_column_attr(table_item->table_name_,
+                                   ObString::make_string(COLUMN_NAMES[i]));
+      if (OB_FAIL(column_expr->add_flag(IS_COLUMN))) {
+        LOG_WARN("failed to mark the describe column", K(ret));
+      } else {
+        ColumnItem column_item;
+        column_item.expr_ = column_expr;
+        column_item.table_id_ = column_expr->get_table_id();
+        column_item.column_id_ = column_expr->get_column_id();
+        column_item.column_name_ = column_expr->get_column_name();
+        if (OB_FAIL(describe_stmt.add_column_item(column_item))) {
+          LOG_WARN("failed to add the describe column item", K(ret));
+        } else {
+          SelectItem select_item;
+          select_item.expr_ = column_expr;
+          select_item.is_real_alias_ = true;
+          select_item.alias_name_ = ObString::make_string(COLUMN_NAMES[i]);
+          select_item.expr_name_ = ObString::make_string(COLUMN_NAMES[i]);
+          if (OB_FAIL(describe_stmt.add_select_item(select_item))) {
+            LOG_WARN("failed to add the describe select item", K(ret));
+          }
+        }
+      }
     }
   }
   return ret;

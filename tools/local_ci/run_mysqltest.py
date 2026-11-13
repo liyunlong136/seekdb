@@ -33,6 +33,23 @@ SUITE_ROOT = MYSQL_TEST_ROOT / "test_suite"
 OUT_ROOT = Path(os.environ.get("SEEKDB_LOCAL_CI_OUT", "/tmp/seekdb_local_ci"))
 
 
+def base_variables(port, user, password):
+    """The variables mysqltest predefines before it reads a .test file."""
+    return {
+        "OBSERVER_DIR": os.environ.get(
+            "SEEKDB_OBSERVER_DIR",
+            os.environ.get("SEEKDB_BASE_DIR", "/tmp/seekdb_home"),
+        ),
+        "PWD": str(MYSQL_TEST_ROOT.parent),
+        "MYSQL_TEST": str(MYSQL_TEST_ROOT),
+        "OBMYSQL_MS0": "%s:%d" % (os.environ.get("SEEKDB_HOST", "127.0.0.1"), port),
+        "OBMYSQL_PORT": str(port),
+        "OBMYSQL_USER": user,
+        "OBMYSQL_PWD": password,
+        "MASTER_IP": os.environ.get("SEEKDB_HOST", "127.0.0.1"),
+    }
+
+
 class CaseError(RuntimeError):
     pass
 
@@ -41,22 +58,41 @@ class CaseError(RuntimeError):
 # .test parsing
 # --------------------------------------------------------------------------
 class Statement:
-    def __init__(self, text, line_no, expect_errors=None, result_log=True, echo=None):
+    def __init__(self, text, line_no, expect_errors=None, result_log=True,
+                 echo_query=True, echo=None):
         self.text = text
         self.line_no = line_no
         self.expect_errors = expect_errors
+        # --disable_result_log hides the rows, --disable_query_log hides the
+        # statement itself, the suites use the two independently
         self.result_log = result_log
+        self.echo_query = echo_query
         self.echo = echo
 
 
-def expand(text, variables):
+def expand(text, variables, _depth=0):
     def repl(match):
         name = match.group(1)
         if name not in variables:
             raise CaseError("undefined variable $%s" % name)
         return variables[name]
 
-    return re.sub(r"\$(\w+)", repl, text)
+    result = re.sub(r"\$(\w+)", repl, text)
+    # a variable may hold another variable, for example a whole shell command
+    if result != text and _depth < 8:
+        return expand(result, variables, _depth + 1)
+    return result
+
+
+def resolve_let_value(value, variables):
+    """Resolve the right hand side of a ``let`` statement."""
+    value = value.strip().strip("'\"")
+    if value.endswith(";"):
+        value = value[:-1].strip()
+    if value.startswith("query_get_value("):
+        # the suites only read the connection host that way, a local run has one
+        return os.environ.get("SEEKDB_HOST", "127.0.0.1")
+    return expand(value, variables)
 
 
 def _resolve_source(target):
@@ -89,6 +125,7 @@ def parse_test(path, variables, source_stack=None):
     actions = []
     expect_errors = None
     result_log = True
+    query_log = True
     pending = []
     pending_start = 0
     lines = path.read_text(encoding="utf-8").splitlines()
@@ -120,6 +157,8 @@ def parse_test(path, variables, source_stack=None):
                 expect_errors = codes or [0]
             elif directive in ("disable_result_log", "enable_result_log"):
                 result_log = directive == "enable_result_log"
+            elif directive in ("disable_query_log", "enable_query_log"):
+                query_log = directive == "enable_query_log"
             elif directive in ("disable_warnings", "enable_warnings"):
                 pass
             elif directive.startswith("source "):
@@ -134,7 +173,7 @@ def parse_test(path, variables, source_stack=None):
                 if "=" not in body:
                     raise CaseError("unsupported let directive: %s" % directive)
                 name, value = body.split("=", 1)
-                variables[name.strip().lstrip("$")] = value.strip().strip("'\"")
+                variables[name.strip().lstrip("$")] = resolve_let_value(value, variables)
             elif directive.startswith("replace_column") or directive.startswith("sorted_result"):
                 raise CaseError("unsupported directive: %s" % directive)
             else:
@@ -156,7 +195,13 @@ def parse_test(path, variables, source_stack=None):
             body = stripped[4:].strip()
             if "=" in body:
                 name, value = body.split("=", 1)
-                variables[name.strip().lstrip("$")] = value.strip().strip("'\"")
+                variables[name.strip().lstrip("$")] = resolve_let_value(value, variables)
+            continue
+        if lowered.startswith("exec "):
+            command = stripped[5:].strip()
+            if command.endswith(";"):
+                command = command[:-1].strip()
+            actions.append(("exec", expand(command, variables)))
             continue
 
         if not pending:
@@ -170,7 +215,7 @@ def parse_test(path, variables, source_stack=None):
 
         sql = joined.rstrip()
         pending = []
-        if stripped.lower().startswith("eval "):
+        if sql.lower().startswith("eval "):
             sql = expand(sql[5:].strip(), variables)
         actions.append(
             (
@@ -180,6 +225,7 @@ def parse_test(path, variables, source_stack=None):
                     pending_start,
                     expect_errors=expect_errors,
                     result_log=result_log,
+                    echo_query=query_log,
                 ),
             )
         )
@@ -199,13 +245,19 @@ def format_value(value):
         return "1" if value else "0"
     if isinstance(value, bytes):
         return value.decode("utf-8", "replace")
+    if isinstance(value, float):
+        # the server prints 87.0 as "87", the default float repr would not
+        if value.is_integer() and abs(value) < 1e15:
+            return str(int(value))
+        return repr(value)
     return str(value)
 
 
 def render(statement, columns, rows, error=None):
     out = []
-    if statement.result_log:
+    if statement.echo_query:
         out.append(statement.text)
+    if statement.result_log:
         if error is None:
             if columns:
                 out.append("\t".join(str(c) for c in columns))
@@ -295,9 +347,59 @@ def connect(host, port, user, password, database):
     )
 
 
+def shell_bin_dir():
+    """ssh/scp stand-ins so a fixture include also works without a remote host."""
+    bin_dir = OUT_ROOT / "shell"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    ssh = bin_dir / "ssh"
+    scp = bin_dir / "scp"
+    ssh.write_text('#!/bin/sh\nshift\nexec /bin/bash -c "$*"\n', encoding="utf-8")
+    scp.write_text(
+        '#!/bin/sh\n'
+        'set -e\n'
+        'last=""\n'
+        'all=""\n'
+        'for a in "$@"; do\n'
+        '  case "$a" in\n'
+        '    -*) ;;\n'
+        '    *) all="$all\\n$a"; last="$a" ;;\n'
+        '  esac\n'
+        'done\n'
+        'dst="${last#*:}"\n'
+        "printf \"%b\" \"$all\" | sed '$d' | while IFS= read -r s; do\n"
+        '  if [ -n "$s" ]; then cp -r "$s" "$dst"; fi\n'
+        'done\n',
+        encoding="utf-8",
+    )
+    os.chmod(ssh, 0o755)
+    os.chmod(scp, 0o755)
+    return bin_dir
+
+
+def run_shell(command):
+    """Run one ``exec`` command of a .test file."""
+    import subprocess
+
+    env = dict(os.environ)
+    env["PATH"] = str(shell_bin_dir()) + os.pathsep + env.get("PATH", "")
+    completed = subprocess.run(
+        ["/bin/bash", "-c", command],
+        cwd=str(MYSQL_TEST_ROOT.parent),
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    if completed.returncode != 0:
+        raise CaseError(
+            "exec failed (%d): %s\n%s%s"
+            % (completed.returncode, command, completed.stdout, completed.stderr)
+        )
+    return completed
+
+
 def run_case(case_id, test_path, result_path, host, port, user, password, database):
     transcript = []
-    variables = {}
+    variables = base_variables(port, user, password)
     actions = parse_test(test_path, variables)
     connection = connect(host, port, user, password, database)
     try:
@@ -305,6 +407,9 @@ def run_case(case_id, test_path, result_path, host, port, user, password, databa
             for kind, payload in actions:
                 if kind == "echo":
                     transcript.append(payload)
+                    continue
+                if kind == "exec":
+                    run_shell(payload)
                     continue
                 statement = payload
                 columns = []
