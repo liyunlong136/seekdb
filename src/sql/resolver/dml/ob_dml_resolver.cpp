@@ -6230,6 +6230,8 @@ int ObDMLResolver::resolve_read_csv_item(const ParseNode &parse_tree, TableItem 
         }
       } else {
         value.set_varchar(cell.data_, static_cast<ObString::obstr_size_t>(cell.len_));
+        // the datum codegen asserts on a string value without a valid collation
+        value.set_collation_type(res_type.get_collation_type());
       }
       if (cell.is_null_) {
         // the value keeps the type of the column, only the null flag is set
