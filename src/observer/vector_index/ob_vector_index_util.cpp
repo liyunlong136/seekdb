@@ -720,7 +720,7 @@ int ObVectorIndexUtil::get_vector_from_text_by_embedding(ObIAllocator &allocator
       if (OB_FAIL(ObAIFuncJsonUtils::get_json_object(allocator, config))) {
       } else if (OB_FAIL(ObAIFuncJsonUtils::get_json_int(allocator, dim, dim_json))) {
       } else if (OB_FAIL(config->add("dimensions", dim_json))) {
-      } else if (OB_FAIL(model.call_dense_embedding(query_text_copy, config, result))) {
+      } else if (OB_FAIL(model.call_dense_embedding(query_text_copy, config, result, dim))) {
       }
     }
   }

@@ -1,4 +1,17 @@
 {
+  "enable_file_sql": {
+    "id": 10754,
+    "name": "enable_file_sql",
+    "default_value": "0",
+    "base_value": "0",
+    "data_type": "bool",
+    "info": "enable the file as a database feature, which lets a query read csv and jsonl files",
+    "flags": "GLOBAL | SESSION | NEED_SERIALIZE",
+    "publish_version": "",
+    "info_cn": "开启文件即数据库能力",
+    "background_cn": "",
+    "ref_url": ""
+  },
   "auto_increment_increment": {
     "id": 0,
     "name": "auto_increment_increment",

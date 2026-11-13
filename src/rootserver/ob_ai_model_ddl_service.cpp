@@ -72,8 +72,7 @@ int ObAiModelDDLService::drop_ai_model(const obcall::ObDropAiModelArg &arg)
   if (OB_FAIL(ddl_service_.get_runtime_schema_guard_with_version_in_inner_table(schema_guard))) {
   } else if (OB_FAIL(schema_guard.get_ai_model_schema( ai_model_name, old_schema))) {
   } else if (OB_ISNULL(old_schema)) {
-    ret = OB_AI_FUNC_MODEL_NOT_FOUND;
-    LOG_USER_ERROR(OB_AI_FUNC_MODEL_NOT_FOUND, ai_model_name.length(), ai_model_name.ptr());
+    // Idempotent drop: nothing to delete when the model is already gone.
   } else {
     ObDDLSQLTransaction trans(&ddl_service_.get_schema_service());
     ObAiModelDDLOperator ddl_operator(ddl_service_.get_schema_service());
