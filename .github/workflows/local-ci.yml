@@ -211,6 +211,10 @@ jobs:
           probe "switch on: expect the rows" "set session enable_file_sql=on; select id, name, score from read_csv('/tmp/basic.csv') f order by id"
           probe "aggregate: expect 3 rows and the sum" "set session enable_file_sql=on; select count(*) as c, sum(id) as s from read_csv('/tmp/basic.csv') f"
           probe "types: expect int, varchar and double" "set session enable_file_sql=on; select id, name, score from read_csv('/tmp/basic2.csv') f order by id"
+          probe "varchar only" "set session enable_file_sql=on; select name from read_csv('/tmp/basic.csv') f"
+          probe "double only" "set session enable_file_sql=on; select score from read_csv('/tmp/basic.csv') f"
+          probe "int only" "set session enable_file_sql=on; select id from read_csv('/tmp/basic.csv') f"
+          probe "no order by" "set session enable_file_sql=on; select id, name, score from read_csv('/tmp/basic.csv') f"
           probe "null and date: expect NULL for the empty day" "set session enable_file_sql=on; select id, day from read_csv('/tmp/basic2.csv') f order by id"
           probe "legacy 2nd positional: expect ERROR 1064" "select * from read_csv('/tmp/basic.csv', 'xml')"
           probe "unknown named param parses: expect ERROR 1235" "select * from read_csv('/tmp/basic.csv', sample_size = 10)"
@@ -227,6 +231,15 @@ jobs:
             arguments+=(--case "$case_id")
           done
           python3 tools/local_ci/run_mysqltest.py "${arguments[@]}"
+
+      - name: Dump observer warnings
+        if: always()
+        shell: bash
+        run: |
+          sleep 5
+          echo "----- WARN / ERROR lines from the observer log -----"
+          grep -h -E "\[.*\]\[?(WARN|ERROR)\]?" /tmp/seekdb_home/log/seekdb.log | tail -80 || true
+          ls -la /tmp/seekdb_home/log || true
 
       - name: Upload logs
         if: always()
